@@ -1,0 +1,32 @@
+name: Sync to HF Space
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: sync-to-hf-space
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+
+      - name: Push to HF Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          if [ -z "$HF_TOKEN" ]; then
+            echo "::error::HF_TOKEN secret is not set in repo Settings → Secrets and variables → Actions"
+            exit 1
+          fi
+          git push --force \
+            "https://pollen-robotics:${HF_TOKEN}@huggingface.co/spaces/pollen-robotics/reachy_mini_central" \
+            main
