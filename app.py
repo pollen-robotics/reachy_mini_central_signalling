@@ -85,6 +85,30 @@ def _recommended_heartbeat_interval() -> float:
     return max(1.0, LEASE_SECONDS / 3.0)
 
 
+def _session_state_changed_payload(
+    *,
+    producer_id: str,
+    busy: bool,
+    active_app: Optional[str],
+    meta: dict,
+) -> dict:
+    """Build the SSE message body for a busy/free transition.
+
+    Centralised so ``handle_start_session`` and ``handle_end_session``
+    emit the exact same shape; downstream listeners learn the schema
+    once. The ``busy``/``activeApp`` keys mirror those returned by
+    ``/api/robot-status`` and the ``get_producers_list`` rows so
+    clients can share one decoder across all three paths.
+    """
+    return {
+        "type": "sessionStateChanged",
+        "peerId": producer_id,
+        "busy": busy,
+        "activeApp": active_app,
+        "meta": meta,
+    }
+
+
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Spawn / cancel the TTL sweeper task alongside the FastAPI app."""
@@ -547,13 +571,55 @@ class SignalingServer:
                 )
             await self.disconnect_peer(old_id)
 
+    def producer_session_snapshot(
+        self, producer: Peer
+    ) -> tuple[bool, Optional[str]]:
+        """Snapshot ``(busy, activeApp)`` for one producer.
+
+        Single source of truth for "is this robot in use, and by
+        whom". Used by the SSE ``list`` frame (``get_producers_list``),
+        the ``/api/robot-status`` REST view, and the busy/free
+        broadcasts emitted on session start/end. Keeping the
+        extraction in one place means any future tweak (a different
+        fallback for ``activeApp``, a new field like
+        ``sessionStartedAt``, …) only needs to land here.
+
+        ``activeApp`` is the consumer's ``meta.name`` when the
+        partner is still in ``self.peers``; ``None`` when the
+        producer is free, when the consumer disconnected mid-tear
+        down, or when the consumer never advertised a name.
+        """
+        if not producer.session_id:
+            return False, None
+        active_app: Optional[str] = None
+        if producer.partner_id and producer.partner_id in self.peers:
+            active_app = self.peers[producer.partner_id].meta.get("name")
+        return True, active_app
+
     def get_producers_list(self, username: str) -> list:
-        """Get list of producers owned by the given user."""
-        return [
-            {"id": p.peer_id, "meta": p.meta}
-            for p in self.producers.values()
-            if p.connected and p.username == username
-        ]
+        """Get list of producers owned by the given user.
+
+        Mirrors the shape of ``/api/robot-status`` so a listener that
+        connects mid-session sees the correct ``busy``/``activeApp``
+        on its initial ``list`` SSE frame, without needing a follow-up
+        REST call. Subsequent transitions are pushed via
+        ``sessionStateChanged`` (see ``handle_start_session`` and
+        ``handle_end_session``).
+        """
+        out: list[dict] = []
+        for p in self.producers.values():
+            if not (p.connected and p.username == username):
+                continue
+            busy, active_app = self.producer_session_snapshot(p)
+            out.append(
+                {
+                    "id": p.peer_id,
+                    "meta": p.meta,
+                    "busy": busy,
+                    "activeApp": active_app,
+                }
+            )
+        return out
 
     async def handle_start_session(self, peer: Peer, message: dict) -> dict:
         """Handle session start request."""
@@ -603,6 +669,24 @@ class SignalingServer:
             "sessionId": session_id
         })
 
+        # Push busy transition to the user's other devices (mobile
+        # + desktop on the same HF account) so they flip their
+        # on-screen "free" affordance to "busy" within the round
+        # trip rather than waiting on the 30 s ``/api/robot-status``
+        # poll. We deliberately exclude the consumer that just
+        # acquired the slot - it already knows via ``sessionStarted``
+        # and echoing would make UIs react twice to their own action.
+        await self.broadcast_to_listeners(
+            _session_state_changed_payload(
+                producer_id=producer_id,
+                busy=True,
+                active_app=peer.meta.get("name"),
+                meta=producer.meta,
+            ),
+            exclude_id=peer.peer_id,
+            owner_username=producer.username,
+        )
+
         logger.info(f"Session started: {session_id}")
         return {"type": "sessionStarted", "peerId": producer_id, "sessionId": session_id}
 
@@ -640,6 +724,11 @@ class SignalingServer:
             return
 
         producer_id, consumer_id = self.sessions[session_id]
+        # Snapshot the producer BEFORE we clear the session, so the
+        # post-cleanup broadcast still carries its meta even when
+        # the producer has already been removed from ``producers``
+        # (e.g. ``disconnect_peer`` calls us right before the del).
+        producer = self.peers.get(producer_id)
 
         msg: dict = {"type": "endSession", "sessionId": session_id}
         if reason is not None:
@@ -653,6 +742,35 @@ class SignalingServer:
                 await self.send_to_peer(peer_id, msg)
 
         del self.sessions[session_id]
+
+        # Push free transition to the user's other devices, mirror
+        # of the start-session broadcast. Owner is resolved from
+        # whichever side of the session is still in ``peers`` so a
+        # producer-side disconnect (which calls into us from
+        # ``disconnect_peer``) still reaches the listeners. If
+        # *both* sides are gone we skip the emit rather than fall
+        # back to a global broadcast - a missing ``owner_username``
+        # would leak the event to every connected listener
+        # regardless of HF user.
+        consumer = self.peers.get(consumer_id)
+        owner_username: Optional[str] = (
+            producer.username
+            if producer is not None
+            else consumer.username
+            if consumer is not None
+            else None
+        )
+        if owner_username is not None:
+            await self.broadcast_to_listeners(
+                _session_state_changed_payload(
+                    producer_id=producer_id,
+                    busy=False,
+                    active_app=None,
+                    meta=producer.meta if producer is not None else {},
+                ),
+                owner_username=owner_username,
+            )
+
         logger.info(f"Session ended: {session_id} (reason={reason!r})")
 
     async def handle_message(self, peer: Peer, message: dict) -> Optional[dict]:
@@ -982,14 +1100,12 @@ async def robot_status(token: str = Depends(_resolve_hf_token)):
     for pid, p in signaling.producers.items():
         if p.username != username:
             continue
-        active_app = None
-        if p.session_id and p.partner_id and p.partner_id in signaling.peers:
-            active_app = signaling.peers[p.partner_id].meta.get("name")
+        busy, active_app = signaling.producer_session_snapshot(p)
         robots.append(
             {
                 "peerId": pid,
                 "robotName": p.meta.get("name"),
-                "busy": p.session_id is not None,
+                "busy": busy,
                 "activeApp": active_app,
                 "meta": p.meta,
                 "last_seen_age_seconds": round(now - p.last_seen, 2),
