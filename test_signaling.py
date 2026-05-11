@@ -193,6 +193,267 @@ async def test_install_id_collision_ends_old_session():
 
 
 # ----------------------------------------------------------------------
+# sessionStateChanged broadcast (busy/free transitions)
+# ----------------------------------------------------------------------
+#
+# A second device of the same HF user (typically the mobile app while
+# the desktop already holds a session) must learn about a busy/free
+# transition without waiting on its 30 s ``/api/robot-status`` poll.
+# Central pushes ``sessionStateChanged`` to every same-owner listener
+# whenever a session starts or ends. Cross-tenant leakage is the
+# regression that would matter most here, so each test explicitly
+# checks that an unrelated user's queue stays empty.
+
+
+def _drain(peer: Peer) -> list[dict]:
+    """Pop everything currently queued on the peer, return as a list.
+
+    Tests that just registered a producer have already filled their
+    listener's queue with the registration broadcast; pulling them
+    here keeps the assertions on the busy/free events from depending
+    on registration frame indices.
+    """
+    out = []
+    while not peer.message_queue.empty():
+        out.append(peer.message_queue.get_nowait())
+    return out
+
+
+@pytest.mark.asyncio
+async def test_start_session_broadcasts_busy_to_same_user_listeners():
+    server = _make_server()
+    producer = _make_peer(server, username="alice")
+    consumer = _make_peer(server, username="alice")
+    listener = _make_peer(server, username="alice")
+    other_user = _make_peer(server, username="bob")
+
+    await server.handle_set_peer_status(
+        producer, {"roles": ["producer"], "meta": {"name": "reachy_mini"}}
+    )
+    consumer.meta = {"name": "Conversation App"}
+    _drain(listener)
+
+    await server.handle_start_session(consumer, {"peerId": producer.peer_id})
+
+    msgs = _drain(listener)
+    busy_msgs = [m for m in msgs if m.get("type") == "sessionStateChanged"]
+    assert len(busy_msgs) == 1
+    assert busy_msgs[0]["busy"] is True
+    assert busy_msgs[0]["activeApp"] == "Conversation App"
+    assert busy_msgs[0]["peerId"] == producer.peer_id
+    assert other_user.message_queue.empty(), "must not leak across users"
+
+
+@pytest.mark.asyncio
+async def test_start_session_does_not_echo_to_acquirer():
+    """The consumer that just started the session already knows about
+    it via the ``sessionStarted`` reply. Echoing a
+    ``sessionStateChanged`` to the same socket would make every UI
+    react twice to its own action.
+    """
+    server = _make_server()
+    producer = _make_peer(server, username="alice")
+    consumer = _make_peer(server, username="alice")
+
+    await server.handle_set_peer_status(
+        producer, {"roles": ["producer"], "meta": {"name": "r"}}
+    )
+    _drain(consumer)
+
+    await server.handle_start_session(consumer, {"peerId": producer.peer_id})
+
+    msgs = _drain(consumer)
+    assert all(
+        m.get("type") != "sessionStateChanged" for m in msgs
+    ), "consumer should not receive the same-owner broadcast for its own action"
+
+
+@pytest.mark.asyncio
+async def test_end_session_broadcasts_free_to_same_user_listeners():
+    server = _make_server()
+    producer = _make_peer(server, username="alice")
+    consumer = _make_peer(server, username="alice")
+    listener = _make_peer(server, username="alice")
+    other_user = _make_peer(server, username="bob")
+
+    await server.handle_set_peer_status(
+        producer, {"roles": ["producer"], "meta": {"name": "r"}}
+    )
+    await server.handle_start_session(consumer, {"peerId": producer.peer_id})
+    _drain(listener)
+
+    assert producer.session_id is not None
+    await server.handle_end_session(producer.session_id, reason="user_stopped")
+
+    msgs = _drain(listener)
+    free_msgs = [m for m in msgs if m.get("type") == "sessionStateChanged"]
+    assert len(free_msgs) == 1
+    assert free_msgs[0]["busy"] is False
+    assert free_msgs[0]["activeApp"] is None
+    assert free_msgs[0]["peerId"] == producer.peer_id
+    assert other_user.message_queue.empty(), "must not leak across users"
+
+
+@pytest.mark.asyncio
+async def test_end_session_when_session_unknown_is_a_noop():
+    """A spurious ``endSession`` for a vanished session id (race after
+    a TTL eviction, double-tap from a flaky client) must not raise
+    and must not emit a broadcast.
+    """
+    server = _make_server()
+    listener = _make_peer(server, username="alice")
+    await server.handle_end_session("ghost-session", reason="ghost")
+    assert listener.message_queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_session_state_broadcast_skips_when_owner_unresolvable():
+    """Anti-leak: if both peers are gone before teardown, central
+    cannot resolve the owner, so it MUST skip the broadcast instead
+    of falling back to a global emit (cross-tenant leak).
+    """
+    server = _make_server()
+    producer = _make_peer(server, username="alice")
+    consumer = _make_peer(server, username="alice")
+    bob_listener = _make_peer(server, username="bob")
+
+    await server.handle_set_peer_status(
+        producer, {"roles": ["producer"], "meta": {"name": "r"}}
+    )
+    await server.handle_start_session(consumer, {"peerId": producer.peer_id})
+    session_id = producer.session_id
+    _drain(bob_listener)
+
+    # Bypass disconnect_peer (which itself calls handle_end_session)
+    # to exercise the "session still in self.sessions but both
+    # peers gone" race directly.
+    del server.peers[producer.peer_id]
+    del server.peers[consumer.peer_id]
+    await server.handle_end_session(session_id, reason="vanished")
+
+    assert bob_listener.message_queue.empty()
+
+
+# ----------------------------------------------------------------------
+# get_producers_list shape (initial SSE list frame for new listeners)
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_producers_list_includes_busy_state_for_active_session():
+    """A listener connecting mid-session must see ``busy=True`` on
+    its initial ``list`` frame, otherwise the UI starts in a stale
+    "free" state and only flips on the next start/end transition.
+    """
+    server = _make_server()
+    producer = _make_peer(server, username="alice")
+    consumer = _make_peer(server, username="alice")
+    consumer.meta = {"name": "Hand Tracker Live"}
+
+    await server.handle_set_peer_status(
+        producer, {"roles": ["producer"], "meta": {"name": "r"}}
+    )
+    await server.handle_start_session(consumer, {"peerId": producer.peer_id})
+
+    rows = server.get_producers_list("alice")
+    assert len(rows) == 1
+    assert rows[0]["id"] == producer.peer_id
+    assert rows[0]["busy"] is True
+    assert rows[0]["activeApp"] == "Hand Tracker Live"
+
+
+@pytest.mark.asyncio
+async def test_producers_list_reports_free_when_no_session():
+    server = _make_server()
+    producer = _make_peer(server, username="alice")
+    await server.handle_set_peer_status(
+        producer, {"roles": ["producer"], "meta": {"name": "r"}}
+    )
+
+    rows = server.get_producers_list("alice")
+    assert len(rows) == 1
+    assert rows[0]["busy"] is False
+    assert rows[0]["activeApp"] is None
+
+
+@pytest.mark.asyncio
+async def test_producers_list_filters_by_owner():
+    """Anti-leak guard at the ``get_producers_list`` level: a future
+    refactor that bypasses the broadcast path can't quietly leak
+    cross-tenant rows on the initial SSE list frame.
+    """
+    server = _make_server()
+    alice_robot = _make_peer(server, username="alice")
+    bob_robot = _make_peer(server, username="bob")
+    for p in (alice_robot, bob_robot):
+        await server.handle_set_peer_status(
+            p, {"roles": ["producer"], "meta": {"name": f"{p.username}-r"}}
+        )
+
+    assert {row["id"] for row in server.get_producers_list("alice")} == {
+        alice_robot.peer_id
+    }
+    assert {row["id"] for row in server.get_producers_list("bob")} == {
+        bob_robot.peer_id
+    }
+
+
+# ----------------------------------------------------------------------
+# producer_session_snapshot helper (single source of truth)
+# ----------------------------------------------------------------------
+#
+# The helper backs three call sites at once: get_producers_list, the
+# /api/robot-status REST view, and the busy/free SSE broadcasts. A
+# direct test pins its contract so a future tweak (different
+# fallback for activeApp, new field in the tuple, etc.) is caught at
+# the helper level instead of cascading into integration-style
+# regressions across all three.
+
+
+@pytest.mark.asyncio
+async def test_producer_session_snapshot_free_when_no_session():
+    server = _make_server()
+    p = _make_peer(server)
+    await server.handle_set_peer_status(
+        p, {"roles": ["producer"], "meta": {"name": "r"}}
+    )
+    assert server.producer_session_snapshot(p) == (False, None)
+
+
+@pytest.mark.asyncio
+async def test_producer_session_snapshot_busy_carries_consumer_app_name():
+    server = _make_server()
+    producer = _make_peer(server, username="alice")
+    consumer = _make_peer(server, username="alice")
+    consumer.meta = {"name": "Hand Tracker Live"}
+    await server.handle_set_peer_status(
+        producer, {"roles": ["producer"], "meta": {"name": "r"}}
+    )
+    await server.handle_start_session(consumer, {"peerId": producer.peer_id})
+
+    assert server.producer_session_snapshot(producer) == (True, "Hand Tracker Live")
+
+
+@pytest.mark.asyncio
+async def test_producer_session_snapshot_busy_with_no_partner_yields_no_app():
+    """``activeApp`` falls back to None when the partner has been
+    evicted mid-session (race) or never advertised a meta.name.
+    The producer is still ``busy`` because its session is still
+    wired - clients should render "in use" without the app label.
+    """
+    server = _make_server()
+    producer = _make_peer(server, username="alice")
+    consumer = _make_peer(server, username="alice")
+    await server.handle_set_peer_status(
+        producer, {"roles": ["producer"], "meta": {"name": "r"}}
+    )
+    await server.handle_start_session(consumer, {"peerId": producer.peer_id})
+    del server.peers[consumer.peer_id]
+
+    assert server.producer_session_snapshot(producer) == (True, None)
+
+
+# ----------------------------------------------------------------------
 # TTL sweeper
 # ----------------------------------------------------------------------
 
