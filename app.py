@@ -7,28 +7,43 @@ This server implements the GStreamer WebRTC signaling protocol using:
 
 This works reliably through HTTP/2 proxies like HuggingFace Spaces.
 
+Design: central is a **stateless matchmaker**. It bootstraps WebRTC
+sessions between mobile/desktop consumers and robot-daemon producers,
+relays SDP/ICE, and maintains a producer registry keyed by a stable
+``token -> peer_id`` mapping. It does **not** decide when a session is
+dead: liveness is owned by the daemon, which has direct visibility into
+the peer connection's data channel and ICE state. When the daemon's
+watchdog decides a session is idle, it closes its PC and announces
+availability via ``setPeerStatus`` (or sends an explicit ``endSession``);
+central reacts to those messages rather than driving evictions of its
+own. Removing the central-side TTL sweeper fixes a class of bugs where
+SSE back-pressure on a healthy consumer would tear down a healthy media
+session.
+
 Lifecycle responsibilities (see ``reachy_mini/docs/SIGNALING.md`` for the
 canonical contract):
 
 - Forward producer ``meta`` verbatim to listeners (no re-interpretation).
-- Track ``last_seen`` per peer; evict peers whose lease has expired.
 - Honour ``setPeerStatus(roles=[])`` by removing the peer from
   ``producers`` immediately (the SSE channel stays open so the daemon
-  can re-register without reconnecting).
+  can re-register without reconnecting). The daemon also uses
+  ``setPeerStatus(roles=["producer"])`` to flip itself back to
+  "available" after its watchdog tears down an idle session.
 - Detect ``install_id`` collisions inside a single user's fleet and
   evict the older producer (last-writer-wins) so a re-flashed daemon
   never coexists with its own ghost.
+- Honour explicit ``endSession`` messages (daemon shutdown, user
+  disconnect, ``robot_busy_local_app``, etc.) and clean up on SSE
+  channel close.
 """
 
 import asyncio
 import hashlib
 import json
 import logging
-import os
 import time
 import uuid
 from collections import deque
-from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Optional, AsyncGenerator
 
@@ -42,47 +57,18 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-# --- Liveness (TTL / lease) settings ---------------------------------
+# --- Liveness ---------------------------------------------------------
 #
-# A peer is considered alive while it keeps its SSE channel open AND
-# its last application-level activity (POST /send or SSE message
-# delivery) is younger than ``LEASE_SECONDS``. The sweeper task scans
-# every ``SWEEPER_INTERVAL_SECONDS`` and evicts any expired peer.
+# Central no longer evicts peers on a TTL. Session liveness is owned by
+# the daemon (which has authoritative visibility into the peer
+# connection's data channel and ICE state). Central remains a stateless
+# matchmaker, idempotent on the ``token -> peer_id`` mapping below; when
+# the daemon decides a session is idle it tears down its PC and sends
+# ``setPeerStatus`` to flip itself back to "available", or an explicit
+# ``endSession`` to clear the session entry here.
 #
-# Sizing: ``LEASE_SECONDS`` MUST be at least ``2.5 *
-# RECOMMENDED_HEARTBEAT`` so a healthy daemon tolerates 2 consecutive
-# missed heartbeats (network blip, transient relay restart) without
-# false eviction. The daemon negotiates its actual heartbeat interval
-# from this lease via the ``welcome`` SSE message (see
-# ``recommended_heartbeat_interval_seconds`` below), so the only
-# parameter we need to keep stable is the lease itself.
-#
-# This Space (tfrere/reachy_mini_central) has ``sleep_time=None`` and
-# ``gcTimeout=48h``, so cold-start latency is not a concern; we can
-# size the lease tightly to minimise the staleness window observed by
-# remote clients (mobile/desktop too far for BLE).
-#
-# 30 s default: heartbeat = lease / 3 = 10 s, which sits comfortably
-# below the 60 s idle timeout typical of HTTP/2 proxies (HF Spaces,
-# Cloudflare). This applies the WebSocket "75 % rule" (heartbeat at
-# 75 % of the shortest proxy timeout) while halving baseline relay
-# traffic vs the previous 5 s cadence. Tunable via env var for local
-# testing of failure paths without a code change.
-LEASE_SECONDS = float(os.getenv("REACHY_CENTRAL_LEASE_SECONDS", "30"))
-SWEEPER_INTERVAL_SECONDS = float(os.getenv("REACHY_CENTRAL_SWEEPER_INTERVAL", "3"))
-
-
-def _recommended_heartbeat_interval() -> float:
-    """Return the heartbeat interval daemons should use, derived from
-    ``LEASE_SECONDS``.
-
-    Lease ÷ 3 gives daemons ~2 consecutive misses of headroom before
-    eviction (heartbeat at t=0,3,6 → last_seen=0; if next 3 fail, lease
-    expires at t=15 with one tick of margin). Daemons receive this in
-    the ``welcome`` frame and adjust their loop accordingly, so server
-    operators only ever need to tune ``LEASE_SECONDS``.
-    """
-    return max(1.0, LEASE_SECONDS / 3.0)
+# The ``Peer.last_seen`` field is retained for diagnostics
+# (/api/robot-status, /api/debug/peers) but does not drive any eviction.
 
 
 def _session_state_changed_payload(
@@ -109,21 +95,7 @@ def _session_state_changed_payload(
     }
 
 
-@asynccontextmanager
-async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    """Spawn / cancel the TTL sweeper task alongside the FastAPI app."""
-    sweeper_task = asyncio.create_task(signaling.run_ttl_sweeper())
-    try:
-        yield
-    finally:
-        sweeper_task.cancel()
-        try:
-            await sweeper_task
-        except asyncio.CancelledError:
-            pass
-
-
-app = FastAPI(title="Reachy Mini Central", lifespan=_lifespan)
+app = FastAPI(title="Reachy Mini Central")
 
 # Add CORS middleware for browser clients.
 #
@@ -322,17 +294,12 @@ async def validate_hf_token(token: str) -> Optional[str]:
 class Peer:
     """Represents a connected peer (robot or client).
 
-    ``last_seen`` is the sole input to the TTL sweeper. We refresh it
-    on every signal that the peer is still wired to us:
-
-    - POST /send received from this peer (strongest signal).
-    - SSE keepalive yielded after a successful
-      ``await request.is_disconnected() == False`` check (the yield
-      proves the TCP stream is still flowing to the peer's socket).
-    - SSE message delivered.
-
-    We deliberately do NOT touch on internal server bookkeeping that
-    has no causal link to peer reachability.
+    ``last_seen`` is **diagnostic-only**: it is set when the peer is
+    created (and on reconnect via ``get_or_create_peer``) and surfaced
+    by /api/robot-status and /api/debug/peers so operators can see
+    how recently a peer was registered. It does NOT drive any eviction
+    decision; session liveness is owned by the daemon (see module
+    docstring).
     """
     peer_id: str
     username: str
@@ -357,69 +324,6 @@ class SignalingServer:
         # is purged on disconnect so a hard-evicted peer doesn't come
         # back with the same id.
         self.token_to_peer: dict[str, str] = {}
-
-    # ------------------------------------------------------------------
-    # Liveness bookkeeping
-    # ------------------------------------------------------------------
-
-    def touch(self, peer_id: str) -> None:
-        """Refresh ``last_seen`` on inbound application traffic.
-
-        Called by the only code paths that prove the peer is actually
-        reachable: a ``POST /send`` arriving from it, or a session
-        message successfully delivered through its message queue
-        (which the consumer side will ack via its own POST round-trip).
-
-        Server-side SSE keepalive pings do NOT call this. A keepalive
-        is just us writing into the local TCP send buffer and observing
-        no immediate error. On a half-open connection (peer's network
-        cut without a clean FIN/RST) the buffer happily absorbs writes
-        for minutes, so refreshing ``last_seen`` on every keepalive
-        would hold zombie peers alive forever - exactly the bug we
-        had before the heartbeat protocol was introduced. Heartbeats
-        are now driven by the daemon (re-emitting ``setPeerStatus``
-        every ``HEARTBEAT_INTERVAL_SECONDS`` even when its meta is
-        unchanged), which arrives here as a real ``POST /send`` and
-        does refresh the lease.
-        """
-        peer = self.peers.get(peer_id)
-        if peer is not None:
-            peer.last_seen = time.monotonic()
-
-    async def run_ttl_sweeper(self) -> None:
-        """Background task: evict peers whose lease has expired.
-
-        See ``LEASE_SECONDS`` and ``SWEEPER_INTERVAL_SECONDS`` at the
-        top of the module. We snapshot the peer ids before iterating
-        because ``disconnect_peer`` mutates ``self.peers``.
-        """
-        logger.info(
-            "TTL sweeper running every %.1fs, lease=%.1fs",
-            SWEEPER_INTERVAL_SECONDS,
-            LEASE_SECONDS,
-        )
-        while True:
-            try:
-                await asyncio.sleep(SWEEPER_INTERVAL_SECONDS)
-                cutoff = time.monotonic() - LEASE_SECONDS
-                stale = [
-                    peer_id
-                    for peer_id, peer in self.peers.items()
-                    if peer.last_seen < cutoff
-                ]
-                for peer_id in stale:
-                    logger.info(
-                        "Lease expired (%.1fs idle): evicting peer %s",
-                        time.monotonic() - self.peers[peer_id].last_seen,
-                        peer_id,
-                    )
-                    await self.disconnect_peer(peer_id)
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                # The sweeper is best-effort; never let one bad iteration
-                # kill the loop and stop us from cleaning up future zombies.
-                logger.exception("TTL sweeper iteration failed: %s", e)
 
     # ------------------------------------------------------------------
     # Peer lifecycle
@@ -471,14 +375,22 @@ class SignalingServer:
           ``peerStatusChanged`` event so listeners learn about the new
           producer.
 
+          This path also doubles as the daemon's "I'm available again"
+          signal: after its watchdog tears down an idle session
+          locally, the daemon re-emits ``setPeerStatus(producer)`` with
+          the same ``install_id``. ``peer.session_id`` was already
+          cleared (either by the daemon sending ``endSession`` or by
+          the install_id collision path below), so this simply
+          refreshes ``producers`` and lets same-user listeners learn
+          the robot is free again.
+
         - ``roles=["listener"]``: mark as listener, no broadcast.
 
         - ``roles=[]``: explicit withdraw. The peer wants to be removed
           from ``producers`` but keep its SSE channel open so it can
           re-register later. We end any active session it had, drop it
           from ``producers``, and tell other listeners (same user) so
-          their UI clears the row immediately - no waiting for a TTL
-          or SSE close.
+          their UI clears the row immediately.
         """
         roles = message.get("roles", [])
         meta = message.get("meta", {})
@@ -809,10 +721,10 @@ class SignalingServer:
     async def disconnect_peer(self, peer_id: str):
         """Fully evict a peer from every server-side structure.
 
-        Called from three places:
+        Called from two places:
 
-        - SSE close path (``request.is_disconnected()`` becoming true).
-        - The TTL sweeper, when a peer goes silent for ``LEASE_SECONDS``.
+        - SSE close path (``request.is_disconnected()`` becoming true:
+          the peer's HTTP channel closed cleanly).
         - ``_evict_install_id_collisions``, when a duplicate registers.
 
         Cleanup is exhaustive on purpose: ``peers``, ``producers``,
@@ -888,19 +800,13 @@ async def events(request: Request, token: str = Depends(_resolve_hf_token)):
     peer = signaling.get_or_create_peer(token, username)
 
     async def event_generator() -> AsyncGenerator[dict, None]:
-        # Send welcome message with username for client info. We do
-        # NOT touch ``last_seen`` here: a fresh peer was just created
-        # by ``get_or_create_peer`` (which seeded ``last_seen``), and
-        # touching on outbound writes is unsound liveness anyway.
-        # Inbound traffic (POST /send) is the only authoritative
-        # signal, and the daemon's heartbeat will produce one within
-        # ``recommended_heartbeat_interval_seconds`` (see below).
-        #
-        # ``lease_seconds`` and ``recommended_heartbeat_interval_seconds``
-        # let the daemon auto-tune its heartbeat loop so the only knob
-        # operators need to turn lives here on the server. Older daemon
-        # versions ignore unknown welcome fields, so this is fully
-        # backwards-compatible: they keep using their hard-coded default.
+        # Send welcome message with username for client info. Central
+        # no longer advertises a lease / heartbeat interval: liveness
+        # is owned by the daemon, which decides for itself when to
+        # tear down an idle PC and ``setPeerStatus`` itself back to
+        # available. Older daemons that read these fields fall back to
+        # their internal defaults, which is fine because nothing on
+        # central depends on the daemon's heartbeat cadence anymore.
         yield {
             "event": "message",
             "data": json.dumps(
@@ -908,8 +814,6 @@ async def events(request: Request, token: str = Depends(_resolve_hf_token)):
                     "type": "welcome",
                     "peerId": peer.peer_id,
                     "username": username,
-                    "lease_seconds": LEASE_SECONDS,
-                    "recommended_heartbeat_interval_seconds": _recommended_heartbeat_interval(),
                 }
             ),
         }
@@ -919,37 +823,22 @@ async def events(request: Request, token: str = Depends(_resolve_hf_token)):
 
         try:
             while True:
-                # Check if client disconnected. This is best-effort:
+                # Check if client disconnected. Best-effort:
                 # ``is_disconnected`` returns True on FIN/RST visible
                 # to starlette, but half-open sockets can stay False
-                # for minutes behind HTTP/2 proxies. The TTL sweeper
-                # is the authoritative cleanup path for those.
+                # for minutes behind HTTP/2 proxies. The daemon is the
+                # authoritative liveness owner and will close its end
+                # when it decides the session is dead.
                 if await request.is_disconnected():
                     break
 
                 try:
-                    # Wait for message with timeout. A queued message
-                    # exists because some other peer (typically a
-                    # consumer) sent us application traffic that we
-                    # are forwarding here. That counts as evidence
-                    # that the addressee was relevant; we refresh
-                    # ``last_seen`` so an in-flight session never
-                    # races the sweeper.
                     message = await asyncio.wait_for(peer.message_queue.get(), timeout=30.0)
-                    signaling.touch(peer.peer_id)
                     yield {"event": "message", "data": json.dumps(message)}
                 except asyncio.TimeoutError:
                     # Server-pushed keepalive. Its ONLY job is to keep
                     # the HTTP/2 proxy in front of us from killing the
                     # idle connection (HF Spaces, Cloudflare, etc.).
-                    # We deliberately do NOT ``touch()`` here: a yield
-                    # that doesn't raise proves nothing about the
-                    # peer's reachability (the local TCP send buffer
-                    # absorbs writes silently on half-open sockets).
-                    # The daemon's heartbeat (every
-                    # ``HEARTBEAT_INTERVAL_SECONDS``, arriving as a
-                    # POST /send) is the authoritative liveness
-                    # signal. See ``docs/SIGNALING.md``.
                     yield {"event": "ping", "data": ""}
 
         finally:
@@ -977,11 +866,6 @@ async def send_message(request: Request, token: str = Depends(_resolve_hf_token)
         raise HTTPException(status_code=400, detail="Peer not found")
 
     peer = signaling.peers[peer_id]
-    # POST /send is the strongest "the peer is alive" signal we have:
-    # the daemon explicitly chose to talk to us right now. Refresh the
-    # lease before processing so the sweeper never preempts in-flight
-    # work.
-    signaling.touch(peer_id)
 
     body = await request.json()
     response = await signaling.handle_message(peer, body)
@@ -1034,20 +918,12 @@ async def root():
 
 @app.get("/health")
 async def health():
-    """Health check endpoint.
-
-    Exposes the liveness parameters so external clients (and the daemon
-    welcome handshake) can introspect the active configuration without
-    redeploying.
-    """
+    """Health check endpoint."""
     return {
         "status": "healthy",
         "peers": len([p for p in signaling.peers.values() if p.connected]),
         "producers": len(signaling.producers),
         "sessions": len(signaling.sessions),
-        "lease_seconds": LEASE_SECONDS,
-        "sweeper_interval_seconds": SWEEPER_INTERVAL_SECONDS,
-        "recommended_heartbeat_interval_seconds": _recommended_heartbeat_interval(),
     }
 
 
@@ -1061,7 +937,6 @@ async def robot_status(token: str = Depends(_resolve_hf_token)):
 
     Response shape:
         {
-            "lease_seconds": 15,
             "robots": [
                 {
                     "peerId": "...",
@@ -1082,12 +957,10 @@ async def robot_status(token: str = Depends(_resolve_hf_token)):
     Forwarded verbatim so future daemon-side fields (capabilities, version,
     ...) appear without another central change.
 
-    ``last_seen_age_seconds`` is the wall-time gap since the producer last
-    sent inbound traffic (POST /send heartbeat). Clients can gate their UI
-    "reachable" state on ``age < lease_seconds * 0.6`` for a tighter
-    freshness check than the server-side sweeper window. ``lease_seconds``
-    is mirrored at the top level so clients don't need to query
-    ``/health`` separately.
+    ``last_seen_age_seconds`` is the wall-time gap since the producer's
+    peer entry was last refreshed on central (registration / reconnect).
+    Diagnostic only — central no longer evicts on idleness; the daemon
+    owns session liveness end-to-end.
     """
     username = await validate_hf_token(token)
     if not username:
@@ -1112,7 +985,7 @@ async def robot_status(token: str = Depends(_resolve_hf_token)):
             }
         )
 
-    return {"lease_seconds": LEASE_SECONDS, "robots": robots}
+    return {"robots": robots}
 
 
 @app.get("/api/debug/peers")
@@ -1131,8 +1004,6 @@ async def debug_peers(token: str = Depends(_resolve_hf_token)):
 
     Response shape:
         {
-            "lease_seconds": 15,
-            "sweeper_interval_seconds": 3,
             "now": 1234.56,
             "peers": [
                 {
@@ -1176,8 +1047,6 @@ async def debug_peers(token: str = Depends(_resolve_hf_token)):
         )
 
     return {
-        "lease_seconds": LEASE_SECONDS,
-        "sweeper_interval_seconds": SWEEPER_INTERVAL_SECONDS,
         "now": round(now, 2),
         "peers": peers,
     }
