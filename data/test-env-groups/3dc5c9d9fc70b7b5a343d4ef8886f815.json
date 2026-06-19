@@ -1,1 +1,1 @@
-{"id":"3dc5c9d9fc70b7b5a343d4ef8886f815","fullName":"test_resolver#test_bearer_header_empty_token_is_rejected","name":"test_bearer_header_empty_token_is_rejected","status":"passed","testResultsByEnv":{"default":"7c376ac72cecb18360bb2006ddd54649"}}
+{"id":"3dc5c9d9fc70b7b5a343d4ef8886f815","fullName":"test_resolver#test_bearer_header_empty_token_is_rejected","name":"test_bearer_header_empty_token_is_rejected","status":"passed","testResultsByEnv":{"default":"e426e4579586deac83ac96411b73bcdd"}}
