@@ -1,0 +1,82 @@
+"DESCRIPTION","DURATION IN MS","NAME","PARENT SUITE","START TIME","STATUS","STOP TIME","SUB SUITE","SUITE","TEST CLASS","TEST METHOD"
+"The bucket length must equal the number of allowed calls so far,
+    so capacity planning is straightforward.
+    ","0","test_rate_limit_records_each_allowed_request","","2026-06-19","passed","2026-06-19","","test_signaling","",""
+"Same token -> same bucket key (deterministic), different tokens
+    -> different keys (no collisions at this scale).
+    ","0","test_rate_limit_key_is_stable_and_non_reversible","","2026-06-19","passed","2026-06-19","","test_signaling","",""
+"","1","test_bearer_header_whitespace_only_token_is_rejected","","2026-06-19","passed","2026-06-19","","test_resolver","",""
+"","0","test_missing_both_raises_401","","2026-06-19","passed","2026-06-19","","test_resolver","",""
+"","1","test_producer_session_snapshot_busy_carries_consumer_app_name","","2026-06-19","passed","2026-06-19","","test_signaling","",""
+"Basic auth must NOT leak through as a bare-string token.","1","test_basic_auth_scheme_is_rejected","","2026-06-19","passed","2026-06-19","","test_resolver","",""
+"","1","test_query_token_is_accepted_and_deprecation_is_logged_once","","2026-06-19","passed","2026-06-19","","test_resolver","",""
+"Two daemons under the same HF account (different tokens) get
+    independent buckets. This is the regression test for the original
+    incident: heartbeat traffic from one robot must not starve the
+    other.
+    ","1","test_rate_limit_isolates_peers_under_same_user","","2026-06-19","passed","2026-06-19","","test_signaling","",""
+"","1","test_end_session_broadcasts_free_to_same_user_listeners","","2026-06-19","passed","2026-06-19","","test_signaling","",""
+"After the daemon sends ``endSession`` and re-registers, the
+    producer slot must be present AND session_id/partner_id must be
+    clear so the next consumer can start a fresh session.
+    ","0","test_reregister_after_endsession_clears_session_state","","2026-06-19","passed","2026-06-19","","test_signaling","",""
+"","0","test_reregister_after_withdraw_restores_producer_slot","","2026-06-19","passed","2026-06-19","","test_signaling","",""
+"","0","test_withdraw_broadcasts_to_same_user_listeners","","2026-06-19","passed","2026-06-19","","test_signaling","",""
+"``activeApp`` falls back to None when the partner has been
+    evicted mid-session (race) or never advertised a meta.name.
+    The producer is still ``busy`` because its session is still
+    wired - clients should render ""in use"" without the app label.
+    ","0","test_producer_session_snapshot_busy_with_no_partner_yields_no_app","","2026-06-19","passed","2026-06-19","","test_signaling","",""
+"","0","test_rate_limit_allows_requests_under_threshold","","2026-06-19","passed","2026-06-19","","test_signaling","",""
+"A timestamp older than the window must roll out without waiting
+    for a counter reset. The deque-based implementation enforces this
+    naturally; this test guards against a regression to a fixed-window
+    counter.
+    ","0","test_rate_limit_sliding_window_drops_aged_timestamps","","2026-06-19","passed","2026-06-19","","test_signaling","",""
+"If both are sent, the Authorization header wins and the query
+    is ignored without logging deprecation (header users are compliant).","0","test_header_takes_precedence_over_query","","2026-06-19","passed","2026-06-19","","test_resolver","",""
+"","1","test_start_session_broadcasts_busy_to_same_user_listeners","","2026-06-19","passed","2026-06-19","","test_signaling","",""
+"","0","test_bearer_header_is_accepted","","2026-06-19","passed","2026-06-19","","test_resolver","",""
+"","0","test_bearer_header_trims_whitespace","","2026-06-19","passed","2026-06-19","","test_resolver","",""
+"","1","test_bearer_header_case_insensitive_scheme","","2026-06-19","passed","2026-06-19","","test_resolver","",""
+"Anti-leak guard at the ``get_producers_list`` level: a future
+    refactor that bypasses the broadcast path can't quietly leak
+    cross-tenant rows on the initial SSE list frame.
+    ","0","test_producers_list_filters_by_owner","","2026-06-19","passed","2026-06-19","","test_signaling","",""
+"A spurious ``endSession`` for a vanished session id (race after
+    a TTL eviction, double-tap from a flaky client) must not raise
+    and must not emit a broadcast.
+    ","0","test_end_session_when_session_unknown_is_a_noop","","2026-06-19","passed","2026-06-19","","test_signaling","",""
+"'Bearer' with nothing after must 401, not return ''.","0","test_bearer_header_empty_token_is_rejected","","2026-06-19","passed","2026-06-19","","test_resolver","",""
+"Anti-leak: if both peers are gone before teardown, central
+    cannot resolve the owner, so it MUST skip the broadcast instead
+    of falling back to a global emit (cross-tenant leak).
+    ","0","test_session_state_broadcast_skips_when_owner_unresolvable","","2026-06-19","passed","2026-06-19","","test_signaling","",""
+"","0","test_producers_list_reports_free_when_no_session","","2026-06-19","passed","2026-06-19","","test_signaling","",""
+"Once the window is full, the next call returns False - the caller
+    is expected to translate that into a 429.
+    ","1","test_rate_limit_blocks_requests_over_threshold","","2026-06-19","passed","2026-06-19","","test_signaling","",""
+"A raw token with no scheme is not RFC 6750 shaped — reject it.","1","test_bare_token_in_header_is_rejected","","2026-06-19","passed","2026-06-19","","test_resolver","",""
+"A listener connecting mid-session must see ``busy=True`` on
+    its initial ``list`` frame, otherwise the UI starts in a stale
+    ""free"" state and only flips on the next start/end transition.
+    ","0","test_producers_list_includes_busy_state_for_active_session","","2026-06-19","passed","2026-06-19","","test_signaling","",""
+"","0","test_disconnect_peer_idempotent","","2026-06-19","passed","2026-06-19","","test_signaling","",""
+"","0","test_producer_session_snapshot_free_when_no_session","","2026-06-19","passed","2026-06-19","","test_signaling","",""
+"The consumer that just started the session already knows about
+    it via the ``sessionStarted`` reply. Echoing a
+    ``sessionStateChanged`` to the same socket would make every UI
+    react twice to its own action.
+    ","0","test_start_session_does_not_echo_to_acquirer","","2026-06-19","passed","2026-06-19","","test_signaling","",""
+"","0","test_install_id_collision_ends_old_session","","2026-06-19","passed","2026-06-19","","test_signaling","",""
+"Sanity bound on the configured capacity: at least 600 req/min
+    (~10 req/s) per peer so heartbeats + signaling + reconnects fit
+    comfortably without retuning.
+    ","0","test_rate_limit_default_capacity_matches_industry_baseline","","2026-06-19","passed","2026-06-19","","test_signaling","",""
+"Different HF users hitting the same install_id (rare hardware swap)
+    must NOT evict each other - that is handled at the auth layer.","0","test_install_id_collision_does_not_cross_users","","2026-06-19","passed","2026-06-19","","test_signaling","",""
+"","0","test_disconnect_peer_clears_all_structures","","2026-06-19","passed","2026-06-19","","test_signaling","",""
+"","0","test_withdraw_when_not_a_producer_is_a_noop","","2026-06-19","passed","2026-06-19","","test_signaling","",""
+"","1","test_digest_scheme_is_rejected","","2026-06-19","passed","2026-06-19","","test_resolver","",""
+"","0","test_install_id_collision_evicts_old_producer","","2026-06-19","passed","2026-06-19","","test_signaling","",""
+"","1","test_withdraw_removes_from_producers_but_keeps_peer_alive","","2026-06-19","passed","2026-06-19","","test_signaling","",""

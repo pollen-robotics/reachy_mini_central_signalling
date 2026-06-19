@@ -1,0 +1,2 @@
+WARNING  app:app.py:205 [deprecation] HF token received via query string from 1.2.3.4. Switch to Authorization: Bearer <token> — the query form will be removed in a future release.
+WARNING  app:app.py:205 [deprecation] HF token received via query string from 9.9.9.9. Switch to Authorization: Bearer <token> — the query form will be removed in a future release.
