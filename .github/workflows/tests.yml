@@ -37,9 +37,7 @@ jobs:
 
       - name: Install Allure Report 3
         if: always()
-        # Pin 3.8.2: it expands the suite tree by default in the report UI
-        # (3.9+ collapses everything, requiring a manual expand).
-        run: npm install --no-save allure@3.8.2 @allurereport/plugin-awesome@3.8.2
+        run: npm install --no-save allure @allurereport/plugin-awesome
 
       - name: Get previous Allure history
         if: always()
