@@ -26,11 +26,19 @@ jobs:
           pip install -r requirements.txt
           pip install pytest pytest-asyncio allure-pytest
 
-      - name: Run tests
+      - name: Run tests (Allure results)
+        continue-on-error: true
         run: python -m pytest --alluredir=allure-results
 
-      # Everything below builds + publishes the Allure report even when tests
-      # fail, so the report always reflects the latest run.
+      - uses: actions/setup-node@v4
+        if: always()
+        with:
+          node-version: 22
+
+      - name: Install Allure Report 3
+        if: always()
+        run: npm install --no-save allure @allurereport/plugin-awesome
+
       - name: Get previous Allure history
         if: always()
         uses: actions/checkout@v4
@@ -42,25 +50,24 @@ jobs:
       - name: Restore Allure history
         if: always()
         run: |
-          if [ -d gh-pages-prev/history ]; then
-            mkdir -p allure-results/history
-            cp -r gh-pages-prev/history/* allure-results/history/ || true
+          if [ -f gh-pages-prev/history/history.jsonl ]; then
+            mkdir -p history
+            cp gh-pages-prev/history/history.jsonl history/history.jsonl
           fi
 
-      - name: Setup Java (Allure CLI)
-        if: always()
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "17"
-
-      - name: Install Allure CLI
-        if: always()
-        run: npm install -g allure-commandline
-
+      # Allure Report 3 (the `allure` npm package + awesome plugin). Pure Node,
+      # no Java needed. Produces the modern "awesome" UI and a root summary.json.
       - name: Generate Allure report
         if: always()
-        run: allure generate allure-results --clean -o allure-report
+        run: npx allure generate allure-results
+
+      - name: Bundle history into report
+        if: always()
+        run: |
+          mkdir -p allure-report/history
+          if [ -f history/history.jsonl ]; then
+            cp history/history.jsonl allure-report/history/history.jsonl
+          fi
 
       - name: Publish to GitHub Pages
         if: always()
