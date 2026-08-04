@@ -54,6 +54,7 @@ import uuid
 from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from string import Template
 from typing import Optional, AsyncGenerator
 
 import httpx
@@ -176,11 +177,21 @@ token_cache: dict[str, tuple[str, float]] = {}
 # environment so a second client can authenticate without a real HF
 # token (mirrors prod topology where robot and phone hold DISTINCT
 # tokens of the same user). Format: "token:username[,token:username]".
-# Never set in deployed Spaces. Seeded entries never expire.
-for _seed in os.environ.get("DEV_TOKEN_SEED", "").split(","):
-    if ":" in _seed:
-        _tok, _user = _seed.split(":", 1)
-        token_cache[_tok.strip()] = (_user.strip(), float("inf"))
+# Seeded entries never expire.
+#
+# Defence in depth: hard-disabled on HF Spaces (SPACE_ID is always set
+# there) so an accidentally-configured secret can never become an auth
+# bypass in a deployed environment.
+if not os.environ.get("SPACE_ID"):
+    for _seed in os.environ.get("DEV_TOKEN_SEED", "").split(","):
+        if ":" in _seed:
+            _tok, _user = _seed.split(":", 1)
+            token_cache[_tok.strip()] = (_user.strip(), float("inf"))
+elif os.environ.get("DEV_TOKEN_SEED"):
+    logger.warning(
+        "DEV_TOKEN_SEED is set but ignored: refusing to seed the token "
+        "cache on a deployed Space."
+    )
 
 
 def _prune_token_cache() -> None:
@@ -382,10 +393,29 @@ async def validate_hf_token(token: str) -> Optional[str]:
                 )
                 logger.info(f"Token validated for user: {username}")
                 return username
-            else:
-                logger.warning(f"Token validation failed: {response.status_code}")
+
+            if response.status_code in (401, 403):
+                # Explicit rejection: the token is revoked or invalid.
+                # This is the ONLY case that may drop a cache entry.
+                logger.warning(
+                    f"Token rejected by HF: {response.status_code}"
+                )
                 token_cache.pop(token, None)
                 return None
+
+            # 429 / 5xx: HF is unhappy, not the token. Treat like a
+            # network failure and serve the stale identity if we have
+            # one. Confusing a whoami 429 with a revocation would let
+            # an attacker who exhausts our whoami quota (by spraying
+            # invalid tokens, which are validated pre-rate-limit) turn
+            # HF rate-limiting into fleet-wide 401s at the hourly
+            # re-validation.
+            logger.warning(
+                f"Token validation inconclusive (HF {response.status_code})"
+            )
+            if cached is not None:
+                return cached[0]
+            return None
     except Exception as e:
         logger.error(f"Error validating token: {e}")
         if cached is not None:
@@ -1092,48 +1122,160 @@ async def send_message(request: Request, token: str = Depends(_resolve_hf_token)
     return response or {"status": "ok"}
 
 
-@app.get("/")
-async def root():
-    """Simple status page."""
-    return HTMLResponse(content=f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Reachy Mini Central</title>
-        <style>
-            body {{ font-family: sans-serif; max-width: 800px; margin: 50px auto; padding: 20px; }}
-            .status {{ padding: 10px; background: #e8f5e9; border-radius: 5px; }}
-            .security {{ padding: 10px; background: #e3f2fd; border-radius: 5px; margin-top: 10px; }}
-            code {{ background: #f5f5f5; padding: 2px 6px; border-radius: 3px; }}
-        </style>
-    </head>
-    <body>
-        <h1>Reachy Mini Central</h1>
-        <div class="status">
-            <p><strong>Status:</strong> Running</p>
-            <p><strong>Connected Peers:</strong> {len([p for p in signaling.peers.values() if p.connected])}</p>
-            <p><strong>Active Producers:</strong> {len(signaling.producers)}</p>
-            <p><strong>Active Sessions:</strong> {len(signaling.sessions)}</p>
-        </div>
-        <div class="security">
-            <p><strong>Security:</strong></p>
+# Status page template. Design tokens mirror the Reachy Mini mobile app
+# MUI theme (reachy_mini_mobile_app/src/theme.ts): accent #FF9500,
+# radius 12, system font stack, light/dark palettes selected via
+# prefers-color-scheme. ``string.Template`` ($-placeholders) is used
+# instead of an f-string so CSS/JS braces need no escaping. Counters
+# are server-rendered, then kept live by a small /health poll.
+_STATUS_PAGE = Template("""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Reachy Mini Central</title>
+    <style>
+        :root {
+            --accent: #FF9500;
+            --bg: #fafafa;
+            --paper: #ffffff;
+            --text: #111111;
+            --text-secondary: rgba(0, 0, 0, 0.65);
+            --divider: rgba(0, 0, 0, 0.08);
+            --radius: 12px;
+        }
+        @media (prefers-color-scheme: dark) {
+            :root {
+                --bg: #101013;
+                --paper: #1a1a1a;
+                --text: #f5f5f5;
+                --text-secondary: rgba(255, 255, 255, 0.72);
+                --divider: rgba(255, 255, 255, 0.08);
+            }
+        }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            padding: 48px 20px;
+            background: var(--bg);
+            color: var(--text);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+            line-height: 1.5;
+        }
+        main { max-width: 720px; margin: 0 auto; }
+        header { display: flex; align-items: center; gap: 10px; margin-bottom: 24px; }
+        .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--accent); }
+        h1 { font-size: 24px; font-weight: 700; letter-spacing: -0.2px; margin: 0; }
+        .pill {
+            margin-left: auto;
+            font-size: 12px; font-weight: 600;
+            color: var(--accent);
+            border: 1px solid rgba(255, 149, 0, 0.35);
+            padding: 3px 12px; border-radius: 999px;
+        }
+        .card {
+            background: var(--paper);
+            border: 1px solid var(--divider);
+            border-radius: var(--radius);
+            padding: 20px;
+            margin-bottom: 12px;
+        }
+        .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 12px; }
+        .stats .card { margin-bottom: 0; }
+        .value { font-size: 32px; font-weight: 700; letter-spacing: -0.4px; margin-top: 4px; }
+        .overline {
+            font-size: 11px; font-weight: 600; letter-spacing: 0.5px;
+            text-transform: uppercase; color: var(--text-secondary);
+        }
+        ul { margin: 10px 0 0; padding-left: 20px; color: var(--text-secondary); font-size: 14px; }
+        li { margin-bottom: 4px; }
+        li strong { color: var(--text); font-weight: 600; }
+        code {
+            background: var(--divider);
+            padding: 2px 7px; border-radius: 6px;
+            font-size: 13px;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        }
+        footer { color: var(--text-secondary); font-size: 13px; margin-top: 20px; }
+        @media (max-width: 520px) { .stats { grid-template-columns: 1fr; } }
+    </style>
+</head>
+<body>
+    <main>
+        <header>
+            <span class="dot"></span>
+            <h1>Reachy Mini Central</h1>
+            <span class="pill">running</span>
+        </header>
+        <section class="stats">
+            <div class="card">
+                <div class="overline">Connected peers</div>
+                <div class="value" id="peers">$peers</div>
+            </div>
+            <div class="card">
+                <div class="overline">Active producers</div>
+                <div class="value" id="producers">$producers</div>
+            </div>
+            <div class="card">
+                <div class="overline">Active sessions</div>
+                <div class="value" id="sessions">$sessions</div>
+            </div>
+        </section>
+        <section class="card">
+            <div class="overline">Endpoints</div>
+            <ul>
+                <li><code>GET /events</code> - SSE stream for receiving messages</li>
+                <li><code>POST /send</code> - send messages to server</li>
+                <li><code>GET /api/robot-status</code> - busy/free status of the caller's robots</li>
+                <li><code>GET /health</code> - public counters</li>
+                <li>Authentication: <code>Authorization: Bearer &lt;HF token&gt;</code></li>
+            </ul>
+        </section>
+        <section class="card">
+            <div class="overline">Security</div>
             <ul>
                 <li>HuggingFace token authentication required</li>
                 <li>Owner-based filtering: users only see their own robots</li>
-                <li>Rate limiting: {RATE_LIMIT_REQUESTS} requests per {int(RATE_LIMIT_WINDOW)}s per peer (sliding window)</li>
+                <li>Rate limiting: $rate_requests requests per ${rate_window}s per peer (sliding window)</li>
+                <li>Stale-producer sweep: silent producers evicted after ${lease}s</li>
             </ul>
-        </div>
-        <h2>Endpoints</h2>
-        <ul>
-            <li><code>GET /events</code> - SSE stream for receiving messages</li>
-            <li><code>POST /send</code> - Send messages to server</li>
-        </ul>
-        <p>Authentication: <code>Authorization: Bearer &lt;HF token&gt;</code></p>
-        <h2>Protocol</h2>
-        <p>This server implements the GStreamer WebRTC signaling protocol over HTTP/SSE.</p>
-    </body>
-    </html>
-    """)
+        </section>
+        <footer>
+            Implements the GStreamer WebRTC signaling protocol over HTTP/SSE.
+        </footer>
+    </main>
+    <script>
+        async function refresh() {
+            try {
+                const response = await fetch("/health");
+                if (!response.ok) return;
+                const data = await response.json();
+                for (const key of ["peers", "producers", "sessions"]) {
+                    document.getElementById(key).textContent = data[key];
+                }
+            } catch (err) {
+                // Transient network error: keep last values, retry next tick.
+            }
+        }
+        setInterval(refresh, 3000);
+    </script>
+</body>
+</html>""")
+
+
+@app.get("/")
+async def root():
+    """Status page: server-rendered counters kept live by a /health poll."""
+    return HTMLResponse(
+        content=_STATUS_PAGE.substitute(
+            peers=len([p for p in signaling.peers.values() if p.connected]),
+            producers=len(signaling.producers),
+            sessions=len(signaling.sessions),
+            rate_requests=RATE_LIMIT_REQUESTS,
+            rate_window=int(RATE_LIMIT_WINDOW),
+            lease=int(PRODUCER_LEASE_SECONDS),
+        )
+    )
 
 
 @app.get("/health")

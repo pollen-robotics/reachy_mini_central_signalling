@@ -940,6 +940,32 @@ async def test_revoked_token_is_dropped_on_explicit_rejection(
 
 
 @pytest.mark.asyncio
+async def test_whoami_429_is_not_treated_as_revocation(
+    _clean_token_cache, _fake_whoami
+):
+    """HF rate-limiting our whoami calls (attacker-induced or organic)
+    must NOT log users out: only 401/403 are revocations, anything
+    else degrades to the stale identity.
+    """
+    token_cache["tok"] = ("alice", time.monotonic() - 1.0)
+    _fake_whoami.response = _FakeResponse(429)
+
+    assert await validate_hf_token("tok") == "alice"
+    assert "tok" in token_cache, "entry must survive an HF 429"
+
+
+@pytest.mark.asyncio
+async def test_whoami_5xx_is_not_treated_as_revocation(
+    _clean_token_cache, _fake_whoami
+):
+    token_cache["tok"] = ("alice", time.monotonic() - 1.0)
+    _fake_whoami.response = _FakeResponse(503)
+
+    assert await validate_hf_token("tok") == "alice"
+    assert "tok" in token_cache
+
+
+@pytest.mark.asyncio
 async def test_stale_entry_served_during_validation_outage(
     _clean_token_cache, _fake_whoami
 ):
