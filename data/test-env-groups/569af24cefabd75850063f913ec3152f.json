@@ -1,1 +1,1 @@
-{"id":"569af24cefabd75850063f913ec3152f","fullName":"test_signaling#test_reregister_after_withdraw_restores_producer_slot","name":"test_reregister_after_withdraw_restores_producer_slot","status":"passed","testResultsByEnv":{"default":"5b7a5069a711b421d4444d9d937e2911"}}
+{"id":"569af24cefabd75850063f913ec3152f","fullName":"test_signaling#test_reregister_after_withdraw_restores_producer_slot","name":"test_reregister_after_withdraw_restores_producer_slot","status":"passed","testResultsByEnv":{"default":"47aaf00a6bcf3164c0d5907696f21967"}}

@@ -1,2 +1,0 @@
-ERROR    app:app.py:390 Error validating token: whoami down
-WARNING  app:app.py:392 Serving stale token cache entry for user alice during validation outage

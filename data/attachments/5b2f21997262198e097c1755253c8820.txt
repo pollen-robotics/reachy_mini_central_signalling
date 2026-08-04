@@ -1,0 +1,2 @@
+ERROR    app:app.py:420 Error validating token: whoami down
+WARNING  app:app.py:422 Serving stale token cache entry for user alice during validation outage
