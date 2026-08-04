@@ -10,15 +10,22 @@ This works reliably through HTTP/2 proxies like HuggingFace Spaces.
 Design: central is a **stateless matchmaker**. It bootstraps WebRTC
 sessions between mobile/desktop consumers and robot-daemon producers,
 relays SDP/ICE, and maintains a producer registry keyed by a stable
-``token -> peer_id`` mapping. It does **not** decide when a session is
-dead: liveness is owned by the daemon, which has direct visibility into
-the peer connection's data channel and ICE state. When the daemon's
-watchdog decides a session is idle, it closes its PC and announces
-availability via ``setPeerStatus`` (or sends an explicit ``endSession``);
-central reacts to those messages rather than driving evictions of its
-own. Removing the central-side TTL sweeper fixes a class of bugs where
-SSE back-pressure on a healthy consumer would tear down a healthy media
-session.
+``token -> peer_id`` mapping. **Session** liveness is owned by the
+daemon, which has direct visibility into the peer connection's data
+channel and ICE state: when its watchdog decides a session is idle, it
+closes its PC and announces availability via ``setPeerStatus`` (or
+sends an explicit ``endSession``).
+
+**Registration** liveness, however, is owned by central: a producer
+whose process dies without closing its socket (power cut, yanked
+Wi-Fi) leaves a half-open SSE channel that ``request.is_disconnected()``
+never notices behind an HTTP/2 proxy, so the robot would stay listed
+as connectable forever. The producer sweep (see the Liveness section
+below) evicts producers with no inbound traffic for
+``PRODUCER_LEASE_SECONDS``, keyed exclusively on inbound ``POST /send``
+activity - never on SSE delivery, so back-pressure on a healthy
+consumer can not tear down a healthy media session (the bug that got
+the previous TTL sweeper removed).
 
 Lifecycle responsibilities (see ``reachy_mini/docs/SIGNALING.md`` for the
 canonical contract):
@@ -41,9 +48,11 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import time
 import uuid
 from collections import deque
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Optional, AsyncGenerator
 
@@ -59,16 +68,40 @@ logger = logging.getLogger(__name__)
 
 # --- Liveness ---------------------------------------------------------
 #
-# Central no longer evicts peers on a TTL. Session liveness is owned by
-# the daemon (which has authoritative visibility into the peer
-# connection's data channel and ICE state). Central remains a stateless
-# matchmaker, idempotent on the ``token -> peer_id`` mapping below; when
-# the daemon decides a session is idle it tears down its PC and sends
-# ``setPeerStatus`` to flip itself back to "available", or an explicit
-# ``endSession`` to clear the session entry here.
+# Split ownership:
 #
-# The ``Peer.last_seen`` field is retained for diagnostics
-# (/api/robot-status, /api/debug/peers) but does not drive any eviction.
+# - **Sessions**: owned by the daemon (authoritative visibility into
+#   the PC's data channel / ICE state). Central never ends a session on
+#   idleness; it reacts to ``endSession`` / ``setPeerStatus``.
+# - **Producer registrations**: owned by central. ``Peer.last_seen`` is
+#   refreshed on every inbound application-level message (POST /send),
+#   which includes the daemon's periodic ``setPeerStatus`` heartbeat.
+#   The sweep below evicts producers silent for more than
+#   ``PRODUCER_LEASE_SECONDS`` - the only way to catch half-open
+#   sockets that ``request.is_disconnected()`` never reports.
+#
+# Legacy guard: daemons older than v1.7.2 connect to central but have
+# no heartbeat loop (and no producer health loop to self-heal after an
+# eviction). They are exempted from the sweep, keyed on the absence of
+# ``meta.hardware_id`` - a field introduced by the same v1.7.2 release
+# as the heartbeat, so its presence proves the daemon heartbeats.
+# Exempted producers keep today's behaviour verbatim (including the
+# ghost-on-power-cut bug the sweep fixes for modern daemons).
+#
+# Sizing: lease = 30 s with the heartbeat advertised at 10 s via the
+# SSE ``welcome`` frame gives 2 missed heartbeats of headroom (daemons
+# that predate welcome negotiation fall back to their internal 5 s
+# default, which only adds margin). A live robot evicted during a
+# >30 s network blackout self-heals in <=90 s: its producer health
+# loop (poll 30 s, 2 misses) notices the missing registration and
+# force-reconnects.
+PRODUCER_LEASE_SECONDS = float(
+    os.getenv("REACHY_CENTRAL_PRODUCER_LEASE_SECONDS", "30")
+)
+PRODUCER_SWEEP_INTERVAL_SECONDS = float(
+    os.getenv("REACHY_CENTRAL_PRODUCER_SWEEP_INTERVAL", "5")
+)
+RECOMMENDED_HEARTBEAT_INTERVAL_SECONDS = 10.0
 
 
 def _session_state_changed_payload(
@@ -95,7 +128,21 @@ def _session_state_changed_payload(
     }
 
 
-app = FastAPI(title="Reachy Mini Central")
+@asynccontextmanager
+async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    """Run the stale-producer sweeper for the app's lifetime."""
+    sweeper_task = asyncio.create_task(signaling.run_producer_sweeper())
+    try:
+        yield
+    finally:
+        sweeper_task.cancel()
+        try:
+            await sweeper_task
+        except asyncio.CancelledError:
+            pass
+
+
+app = FastAPI(title="Reachy Mini Central", lifespan=_lifespan)
 
 # Add CORS middleware for browser clients.
 #
@@ -112,8 +159,36 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Cache for validated tokens (token -> username)
-token_cache: dict[str, str] = {}
+# Cache for validated tokens: token -> (username, expires_at monotonic).
+#
+# Entries expire after ``TOKEN_CACHE_TTL_SECONDS`` so a token revoked on
+# HuggingFace stops working here within the TTL instead of surviving
+# until the next Space restart. Expired entries are kept around (and
+# lazily re-validated) so that a transient whoami outage degrades to
+# serving the stale identity rather than 401-ing the whole fleet; only
+# an explicit rejection from HF drops the entry. Entries stale for more
+# than ``TOKEN_CACHE_STALE_GRACE_SECONDS`` are pruned by the sweeper.
+TOKEN_CACHE_TTL_SECONDS = 3600.0
+TOKEN_CACHE_STALE_GRACE_SECONDS = 86400.0
+token_cache: dict[str, tuple[str, float]] = {}
+
+# Local-testing escape hatch: pre-seed the token cache from the
+# environment so a second client can authenticate without a real HF
+# token (mirrors prod topology where robot and phone hold DISTINCT
+# tokens of the same user). Format: "token:username[,token:username]".
+# Never set in deployed Spaces. Seeded entries never expire.
+for _seed in os.environ.get("DEV_TOKEN_SEED", "").split(","):
+    if ":" in _seed:
+        _tok, _user = _seed.split(":", 1)
+        token_cache[_tok.strip()] = (_user.strip(), float("inf"))
+
+
+def _prune_token_cache() -> None:
+    """Drop cache entries whose stale-serving grace has fully elapsed."""
+    now = time.monotonic()
+    for tok, (_, expires_at) in list(token_cache.items()):
+        if now > expires_at + TOKEN_CACHE_STALE_GRACE_SECONDS:
+            del token_cache[tok]
 
 
 # --- Rate limiting --------------------------------------------------
@@ -136,14 +211,29 @@ token_cache: dict[str, str] = {}
 #
 # Sizing: 1200 req / 60 s = 20 req/s sustained per peer, aligned with
 # typical WebRTC signaling servers (CloudGaming reports 200 msg / 10 s
-# per connection). With heartbeat at 10 s (6 req/min), a typical mobile
-# session (offer + answer + ~10 ICE candidates ~ 15 req over a few
-# seconds), and aggressive reconnects, observed peak under load is
-# ~50-100 req/min/peer. We keep a 12-24x headroom so adding features
-# (status polls, presence, etc.) does not require retuning the limit.
+# per connection). With heartbeat at 10 s as advertised in the welcome
+# frame (12 req/min for pre-negotiation daemons on their 5 s default),
+# a typical mobile session (offer + answer + ~10 ICE candidates ~ 15
+# req over a few seconds), and aggressive reconnects, observed peak
+# under load is ~50-100 req/min/peer. We keep a 12-24x headroom so
+# adding features (status polls, presence, etc.) does not require
+# retuning the limit.
 RATE_LIMIT_REQUESTS = 1200
 RATE_LIMIT_WINDOW = 60.0
 _rate_limit_buckets: dict[str, deque[float]] = {}
+
+
+def _prune_rate_limit_buckets() -> None:
+    """Drop buckets whose newest entry aged out of the window.
+
+    ``check_rate_limit`` only trims buckets it is actively serving, so
+    a departed peer's bucket would otherwise pin its timestamps in
+    memory forever. Called by the background sweeper.
+    """
+    cutoff = time.monotonic() - RATE_LIMIT_WINDOW
+    for key, bucket in list(_rate_limit_buckets.items()):
+        if not bucket or bucket[-1] < cutoff:
+            del _rate_limit_buckets[key]
 
 
 def _rate_limit_key(token: str) -> str:
@@ -260,13 +350,20 @@ async def _resolve_hf_token(
 
 
 async def validate_hf_token(token: str) -> Optional[str]:
-    """Validate HuggingFace token and return username if valid."""
+    """Validate HuggingFace token and return username if valid.
+
+    Fresh cache hits are served directly. Expired entries trigger a
+    re-validation against whoami; on transient failure (network,
+    HF outage) the stale identity is served rather than failing the
+    caller, and only an explicit non-200 from HF (revoked / invalid
+    token) drops the entry.
+    """
     if not token:
         return None
 
-    # Check cache first
-    if token in token_cache:
-        return token_cache[token]
+    cached = token_cache.get(token)
+    if cached is not None and time.monotonic() < cached[1]:
+        return cached[0]
 
     try:
         async with httpx.AsyncClient() as client:
@@ -279,14 +376,25 @@ async def validate_hf_token(token: str) -> Optional[str]:
             if response.status_code == 200:
                 data = response.json()
                 username = data.get("name", "unknown")
-                token_cache[token] = username
+                token_cache[token] = (
+                    username,
+                    time.monotonic() + TOKEN_CACHE_TTL_SECONDS,
+                )
                 logger.info(f"Token validated for user: {username}")
                 return username
             else:
                 logger.warning(f"Token validation failed: {response.status_code}")
+                token_cache.pop(token, None)
                 return None
     except Exception as e:
         logger.error(f"Error validating token: {e}")
+        if cached is not None:
+            logger.warning(
+                "Serving stale token cache entry for user %s during "
+                "validation outage",
+                cached[0],
+            )
+            return cached[0]
         return None
 
 
@@ -294,12 +402,16 @@ async def validate_hf_token(token: str) -> Optional[str]:
 class Peer:
     """Represents a connected peer (robot or client).
 
-    ``last_seen`` is **diagnostic-only**: it is set when the peer is
-    created (and on reconnect via ``get_or_create_peer``) and surfaced
-    by /api/robot-status and /api/debug/peers so operators can see
-    how recently a peer was registered. It does NOT drive any eviction
-    decision; session liveness is owned by the daemon (see module
-    docstring).
+    ``last_seen`` is refreshed on every inbound application-level
+    message (``handle_message``, i.e. POST /send traffic - which
+    includes the daemon's periodic heartbeat) and drives the producer
+    sweep for heartbeat-capable daemons. It is also surfaced by
+    /api/robot-status and /api/debug/peers.
+
+    ``sse_generation`` counts SSE connections bound to this peer. A
+    reconnect on the same token supersedes the previous generator:
+    the old one compares its captured generation against this counter
+    and exits without evicting the peer (see the /events endpoint).
     """
     peer_id: str
     username: str
@@ -310,6 +422,7 @@ class Peer:
     session_id: Optional[str] = None
     partner_id: Optional[str] = None
     last_seen: float = field(default_factory=time.monotonic)
+    sse_generation: int = 0
 
 
 class SignalingServer:
@@ -369,7 +482,8 @@ class SignalingServer:
         Three cases:
 
         - ``roles=["producer"]``: register / refresh as producer. If the
-          payload's ``meta.install_id`` collides with an existing producer
+          payload's stable identity (``meta.install_id`` or
+          ``meta.hardware_id``) collides with an existing producer
           of the same user, evict that older producer first
           (last-writer-wins, see ``docs/SIGNALING.md``). Broadcast a
           ``peerStatusChanged`` event so listeners learn about the new
@@ -397,7 +511,7 @@ class SignalingServer:
         peer.meta = meta
 
         if "producer" in roles:
-            await self._evict_install_id_collisions(peer, meta)
+            await self._evict_stable_id_collisions(peer, meta)
             peer.role = "producer"
             self.producers[peer.peer_id] = peer
             logger.info(f"Producer registered: {peer.peer_id} with meta: {meta}")
@@ -446,23 +560,36 @@ class SignalingServer:
             }
         return None
 
-    async def _evict_install_id_collisions(self, new_peer: Peer, new_meta: dict) -> None:
-        """Last-writer-wins on ``meta.install_id`` collisions.
+    async def _evict_stable_id_collisions(self, new_peer: Peer, new_meta: dict) -> None:
+        """Last-writer-wins on stable-identity collisions.
 
-        A re-flashed daemon, a duplicated SD card, or a stale tray
-        process can register a producer whose ``install_id`` matches
-        an already-registered producer of the same user. Without
-        eviction we'd carry both forever and the mobile app would see
-        the robot twice. Policy: keep the newcomer, drop the older.
+        A re-flashed daemon, a duplicated SD card, a stale tray
+        process, or a robot re-provisioned with a fresh token can
+        register a producer that is the same physical robot as an
+        already-registered producer of the same user. Without eviction
+        we'd carry both forever and the mobile app would see the robot
+        twice. Policy: keep the newcomer, drop the older.
 
-        Owner-scoped: a different HF user holding the same
-        ``install_id`` (collisions are unlikely with UUID4 but
-        possible during a hardware swap between two accounts) is left
+        Identity keys, checked independently:
+
+        - ``install_id``: reserved per-install key (not emitted by any
+          shipped daemon yet, kept for forward compatibility).
+        - ``hardware_id``: SHA-256 prefix of the Pollen audio device's
+          USB serial, emitted by daemons >= v1.7.2 - stable per
+          physical robot across reinstalls and renames. This is the
+          key that actually fires in production today.
+
+        Owner-scoped: a different HF user holding the same id
+        (possible during a hardware swap between two accounts) is left
         alone here - cross-tenant collisions are out of scope for the
         signaling server, the auth layer above us guarantees isolation.
         """
-        new_install_id = new_meta.get("install_id")
-        if not new_install_id:
+        new_ids = {
+            key: new_meta.get(key)
+            for key in ("install_id", "hardware_id")
+            if new_meta.get(key)
+        }
+        if not new_ids:
             return
 
         for old_id, old_peer in list(self.producers.items()):
@@ -470,11 +597,16 @@ class SignalingServer:
                 continue
             if old_peer.username != new_peer.username:
                 continue
-            if old_peer.meta.get("install_id") != new_install_id:
+            matched_key = next(
+                (k for k, v in new_ids.items() if old_peer.meta.get(k) == v),
+                None,
+            )
+            if matched_key is None:
                 continue
             logger.info(
-                "install_id collision: %s already held by peer %s, evicting older",
-                new_install_id,
+                "%s collision: %s already held by peer %s, evicting older",
+                matched_key,
+                new_ids[matched_key],
                 old_id,
             )
             if old_peer.session_id is not None:
@@ -687,6 +819,11 @@ class SignalingServer:
 
     async def handle_message(self, peer: Peer, message: dict) -> Optional[dict]:
         """Process incoming message and return response if any."""
+        # Inbound application-level traffic is the liveness signal the
+        # producer sweep keys on: only a peer whose client half is
+        # alive can POST /send (a half-open socket can't).
+        peer.last_seen = time.monotonic()
+
         msg_type = message.get("type", "")
         logger.debug(f"Received from {peer.peer_id}: {msg_type}")
 
@@ -718,14 +855,73 @@ class SignalingServer:
             logger.warning(f"Unknown message type: {msg_type}")
             return None
 
+    async def sweep_stale_producers(self) -> list[str]:
+        """Evict producers with no inbound traffic for a full lease.
+
+        Heartbeat-capable daemons (>= v1.7.2, detected via
+        ``meta.hardware_id`` - shipped by the same release as the
+        heartbeat loop) refresh ``last_seen`` every few seconds
+        through their ``setPeerStatus`` re-emissions on POST /send. A
+        producer silent for more than ``PRODUCER_LEASE_SECONDS`` is
+        therefore a half-open socket (power cut, yanked Wi-Fi), not a
+        healthy robot: evict it fully so it stops showing up as
+        connectable in pickers.
+
+        Producers without ``hardware_id`` (legacy daemons that never
+        heartbeat, or daemons running without a robot attached) are
+        exempt - evicting them would be permanent since they have no
+        health loop to re-register.
+
+        Full ``disconnect_peer`` rather than a soft withdraw: a swept
+        peer is by definition unreachable, keeping its Peer object and
+        token mapping around would only leak memory and rebind a
+        returning daemon onto a dead message queue. If the robot was
+        in fact alive (>30 s network blackout), its producer health
+        loop notices the missing registration within two 30 s polls
+        and force-reconnects - the exact recovery path daemons already
+        exercise on every central redeploy.
+
+        Returns the list of evicted peer ids (handy for tests/logs).
+        """
+        now = time.monotonic()
+        stale = [
+            pid
+            for pid, p in self.producers.items()
+            if p.meta.get("hardware_id")
+            and now - p.last_seen > PRODUCER_LEASE_SECONDS
+        ]
+        for pid in stale:
+            peer = self.peers.get(pid)
+            logger.warning(
+                "Sweeping stale producer %s (name=%r, silent for %.0fs)",
+                pid,
+                peer.meta.get("name") if peer else None,
+                now - peer.last_seen if peer else -1,
+            )
+            await self.disconnect_peer(pid)
+        return stale
+
+    async def run_producer_sweeper(self) -> None:
+        """Background task: periodic stale-producer sweep + cache pruning."""
+        while True:
+            await asyncio.sleep(PRODUCER_SWEEP_INTERVAL_SECONDS)
+            try:
+                await self.sweep_stale_producers()
+                _prune_rate_limit_buckets()
+                _prune_token_cache()
+            except Exception:
+                logger.exception("Producer sweeper iteration failed")
+
     async def disconnect_peer(self, peer_id: str):
         """Fully evict a peer from every server-side structure.
 
-        Called from two places:
+        Called from three places:
 
         - SSE close path (``request.is_disconnected()`` becoming true:
           the peer's HTTP channel closed cleanly).
-        - ``_evict_install_id_collisions``, when a duplicate registers.
+        - ``_evict_stable_id_collisions``, when a duplicate registers.
+        - ``sweep_stale_producers``, when a heartbeat-capable producer
+          went silent for a full lease (half-open socket).
 
         Cleanup is exhaustive on purpose: ``peers``, ``producers``,
         ``token_to_peer`` and the active session are all cleared.
@@ -799,14 +995,27 @@ async def events(request: Request, token: str = Depends(_resolve_hf_token)):
 
     peer = signaling.get_or_create_peer(token, username)
 
+    # One queue and one generation per SSE connection. A reconnect on
+    # the same token (daemon restart while its previous socket is
+    # half-open behind the proxy) supersedes the old generator: it
+    # must neither steal messages from the shared queue nor evict the
+    # peer when its dead socket finally closes. Replacing the queue is
+    # safe because an SSE (re)connect restarts the conversation anyway
+    # (welcome + list are re-sent below); anything queued before the
+    # reconnect addressed the previous connection.
+    peer.sse_generation += 1
+    generation = peer.sse_generation
+    peer.message_queue = asyncio.Queue()
+    queue = peer.message_queue
+
+    def _is_current_connection() -> bool:
+        return signaling.peers.get(peer.peer_id) is peer and peer.sse_generation == generation
+
     async def event_generator() -> AsyncGenerator[dict, None]:
-        # Send welcome message with username for client info. Central
-        # no longer advertises a lease / heartbeat interval: liveness
-        # is owned by the daemon, which decides for itself when to
-        # tear down an idle PC and ``setPeerStatus`` itself back to
-        # available. Older daemons that read these fields fall back to
-        # their internal defaults, which is fine because nothing on
-        # central depends on the daemon's heartbeat cadence anymore.
+        # Send welcome message with username for client info. The
+        # advertised heartbeat cadence drives daemons >= v1.7.2 (they
+        # negotiate from this field); older daemons ignore it and keep
+        # their internal default, which is faster and therefore safe.
         yield {
             "event": "message",
             "data": json.dumps(
@@ -814,6 +1023,7 @@ async def events(request: Request, token: str = Depends(_resolve_hf_token)):
                     "type": "welcome",
                     "peerId": peer.peer_id,
                     "username": username,
+                    "recommended_heartbeat_interval_seconds": RECOMMENDED_HEARTBEAT_INTERVAL_SECONDS,
                 }
             ),
         }
@@ -826,14 +1036,19 @@ async def events(request: Request, token: str = Depends(_resolve_hf_token)):
                 # Check if client disconnected. Best-effort:
                 # ``is_disconnected`` returns True on FIN/RST visible
                 # to starlette, but half-open sockets can stay False
-                # for minutes behind HTTP/2 proxies. The daemon is the
-                # authoritative liveness owner and will close its end
-                # when it decides the session is dead.
+                # forever behind HTTP/2 proxies - that case is covered
+                # by the producer sweep instead.
                 if await request.is_disconnected():
                     break
 
+                # Superseded by a newer connection on the same token,
+                # or evicted (sweep / stable-id collision): stop
+                # serving, and let the finally below skip the eviction.
+                if not _is_current_connection():
+                    break
+
                 try:
-                    message = await asyncio.wait_for(peer.message_queue.get(), timeout=30.0)
+                    message = await asyncio.wait_for(queue.get(), timeout=30.0)
                     yield {"event": "message", "data": json.dumps(message)}
                 except asyncio.TimeoutError:
                     # Server-pushed keepalive. Its ONLY job is to keep
@@ -842,7 +1057,11 @@ async def events(request: Request, token: str = Depends(_resolve_hf_token)):
                     yield {"event": "ping", "data": ""}
 
         finally:
-            await signaling.disconnect_peer(peer.peer_id)
+            # Only the peer's current connection may evict it: a stale
+            # generator closing late must not tear down the live peer
+            # that superseded it.
+            if _is_current_connection():
+                await signaling.disconnect_peer(peer.peer_id)
 
     return EventSourceResponse(event_generator())
 
@@ -906,9 +1125,10 @@ async def root():
         </div>
         <h2>Endpoints</h2>
         <ul>
-            <li><code>GET /events?token=...</code> - SSE stream for receiving messages</li>
-            <li><code>POST /send?token=...</code> - Send messages to server</li>
+            <li><code>GET /events</code> - SSE stream for receiving messages</li>
+            <li><code>POST /send</code> - Send messages to server</li>
         </ul>
+        <p>Authentication: <code>Authorization: Bearer &lt;HF token&gt;</code></p>
         <h2>Protocol</h2>
         <p>This server implements the GStreamer WebRTC signaling protocol over HTTP/SSE.</p>
     </body>
@@ -958,9 +1178,11 @@ async def robot_status(token: str = Depends(_resolve_hf_token)):
     ...) appear without another central change.
 
     ``last_seen_age_seconds`` is the wall-time gap since the producer's
-    peer entry was last refreshed on central (registration / reconnect).
-    Diagnostic only — central no longer evicts on idleness; the daemon
-    owns session liveness end-to-end.
+    last inbound message (POST /send, which includes the daemon's
+    periodic heartbeat). For heartbeat-capable daemons this is a real
+    liveness signal: the sweep evicts producers whose age exceeds
+    ``PRODUCER_LEASE_SECONDS``. For legacy daemons (no ``hardware_id``
+    in ``meta``) it only reflects their last signaling activity.
     """
     username = await validate_hf_token(token)
     if not username:

@@ -30,13 +30,20 @@ from collections import deque
 import pytest
 
 from app import (
+    PRODUCER_LEASE_SECONDS,
     RATE_LIMIT_REQUESTS,
     RATE_LIMIT_WINDOW,
+    TOKEN_CACHE_STALE_GRACE_SECONDS,
+    TOKEN_CACHE_TTL_SECONDS,
     Peer,
     SignalingServer,
+    _prune_rate_limit_buckets,
+    _prune_token_cache,
     _rate_limit_buckets,
     _rate_limit_key,
     check_rate_limit,
+    token_cache,
+    validate_hf_token,
 )
 
 
@@ -655,3 +662,313 @@ def test_rate_limit_default_capacity_matches_industry_baseline():
     """
     assert RATE_LIMIT_REQUESTS >= 600
     assert RATE_LIMIT_WINDOW <= 60.0
+
+
+def test_prune_rate_limit_buckets_drops_aged_and_empty(
+    _clean_rate_limit_buckets,
+):
+    """The sweeper-side prune must reclaim buckets of departed peers
+    (all timestamps aged out) and empty leftovers, but never an active
+    bucket.
+    """
+    now = time.monotonic()
+    _rate_limit_buckets[_rate_limit_key("tok-dead")] = deque(
+        [now - RATE_LIMIT_WINDOW - 5.0]
+    )
+    _rate_limit_buckets[_rate_limit_key("tok-empty")] = deque()
+    _rate_limit_buckets[_rate_limit_key("tok-live")] = deque([now])
+
+    _prune_rate_limit_buckets()
+
+    assert _rate_limit_key("tok-dead") not in _rate_limit_buckets
+    assert _rate_limit_key("tok-empty") not in _rate_limit_buckets
+    assert _rate_limit_key("tok-live") in _rate_limit_buckets
+
+
+# ----------------------------------------------------------------------
+# Liveness: last_seen refresh + stale-producer sweep
+# ----------------------------------------------------------------------
+
+
+HEARTBEATING_META = {"name": "r", "transport": "wifi", "hardware_id": "cafe1234"}
+LEGACY_META = {"name": "old-r", "transport": "wifi"}  # pre-v1.7.2: no hardware_id
+
+
+@pytest.mark.asyncio
+async def test_inbound_message_refreshes_last_seen():
+    """Any POST /send traffic (here: a heartbeat setPeerStatus routed
+    through handle_message) must refresh last_seen - this is the signal
+    the sweep keys on, and what makes last_seen_age_seconds an honest
+    liveness metric for clients.
+    """
+    server = _make_server()
+    p = _make_peer(server)
+    p.last_seen = time.monotonic() - 1000.0
+
+    await server.handle_message(
+        p, {"type": "setPeerStatus", "roles": ["producer"], "meta": HEARTBEATING_META}
+    )
+
+    assert time.monotonic() - p.last_seen < 1.0
+
+
+@pytest.mark.asyncio
+async def test_sweep_evicts_stale_heartbeating_producer():
+    """A heartbeat-capable producer silent for a full lease is a
+    half-open socket: full eviction, and same-user listeners are told.
+    """
+    server = _make_server()
+    ghost = server.get_or_create_peer(token="tok-ghost", username="alice")
+    listener = _make_peer(server, username="alice")
+    await server.handle_message(
+        ghost,
+        {"type": "setPeerStatus", "roles": ["producer"], "meta": HEARTBEATING_META},
+    )
+    while not listener.message_queue.empty():
+        listener.message_queue.get_nowait()
+
+    ghost.last_seen = time.monotonic() - PRODUCER_LEASE_SECONDS - 1.0
+    evicted = await server.sweep_stale_producers()
+
+    assert evicted == [ghost.peer_id]
+    assert ghost.peer_id not in server.producers
+    assert ghost.peer_id not in server.peers
+    assert "tok-ghost" not in server.token_to_peer
+
+    msg = listener.message_queue.get_nowait()
+    assert msg["type"] == "peerStatusChanged"
+    assert msg["roles"] == []
+
+
+@pytest.mark.asyncio
+async def test_sweep_spares_legacy_producer_without_hardware_id():
+    """Daemons < v1.7.2 never heartbeat and cannot self-heal after an
+    eviction (no producer health loop). They must keep today's
+    behaviour verbatim: never swept, however stale.
+    """
+    server = _make_server()
+    legacy = _make_peer(server)
+    await server.handle_message(
+        legacy, {"type": "setPeerStatus", "roles": ["producer"], "meta": LEGACY_META}
+    )
+    legacy.last_seen = time.monotonic() - 10 * PRODUCER_LEASE_SECONDS
+
+    evicted = await server.sweep_stale_producers()
+
+    assert evicted == []
+    assert legacy.peer_id in server.producers
+
+
+@pytest.mark.asyncio
+async def test_sweep_spares_fresh_producer():
+    server = _make_server()
+    fresh = _make_peer(server)
+    await server.handle_message(
+        fresh,
+        {"type": "setPeerStatus", "roles": ["producer"], "meta": HEARTBEATING_META},
+    )
+
+    evicted = await server.sweep_stale_producers()
+
+    assert evicted == []
+    assert fresh.peer_id in server.producers
+
+
+@pytest.mark.asyncio
+async def test_sweep_ends_ghost_session_and_notifies_consumer():
+    """Sweeping a producer that died mid-session must free the session
+    slot and push endSession to the surviving consumer.
+    """
+    server = _make_server()
+    producer = _make_peer(server, username="alice")
+    consumer = _make_peer(server, username="alice")
+    await server.handle_message(
+        producer,
+        {"type": "setPeerStatus", "roles": ["producer"], "meta": HEARTBEATING_META},
+    )
+    response = await server.handle_start_session(
+        consumer, {"peerId": producer.peer_id}
+    )
+    assert response["type"] == "sessionStarted"
+    while not consumer.message_queue.empty():
+        consumer.message_queue.get_nowait()
+
+    producer.last_seen = time.monotonic() - PRODUCER_LEASE_SECONDS - 1.0
+    await server.sweep_stale_producers()
+
+    assert not server.sessions
+    assert consumer.session_id is None
+    types = []
+    while not consumer.message_queue.empty():
+        types.append(consumer.message_queue.get_nowait()["type"])
+    assert "endSession" in types
+
+
+# ----------------------------------------------------------------------
+# Stable-id collisions: hardware_id joins install_id
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_hardware_id_collision_evicts_older_producer():
+    """A robot re-provisioned with a fresh token registers under a new
+    peer while its old registration lingers (half-open ghost).
+    hardware_id - shipped by every daemon >= v1.7.2 - must trigger the
+    last-writer-wins eviction that install_id (not emitted by any
+    shipped daemon) was designed for.
+    """
+    server = _make_server()
+    old = _make_peer(server, username="alice")
+    await server.handle_set_peer_status(
+        old, {"roles": ["producer"], "meta": {"name": "r", "hardware_id": "cafe1234"}}
+    )
+
+    new = _make_peer(server, username="alice")
+    await server.handle_set_peer_status(
+        new, {"roles": ["producer"], "meta": {"name": "r", "hardware_id": "cafe1234"}}
+    )
+
+    assert old.peer_id not in server.producers
+    assert old.peer_id not in server.peers
+    assert new.peer_id in server.producers
+
+
+@pytest.mark.asyncio
+async def test_hardware_id_collision_scoped_to_owner():
+    server = _make_server()
+    alices = _make_peer(server, username="alice")
+    await server.handle_set_peer_status(
+        alices, {"roles": ["producer"], "meta": {"name": "r", "hardware_id": "cafe1234"}}
+    )
+
+    bobs = _make_peer(server, username="bob")
+    await server.handle_set_peer_status(
+        bobs, {"roles": ["producer"], "meta": {"name": "r", "hardware_id": "cafe1234"}}
+    )
+
+    assert alices.peer_id in server.producers, "cross-tenant eviction is forbidden"
+    assert bobs.peer_id in server.producers
+
+
+# ----------------------------------------------------------------------
+# Token cache: TTL, serve-stale-on-error, explicit-rejection drop
+# ----------------------------------------------------------------------
+
+
+@pytest.fixture
+def _clean_token_cache():
+    snapshot = dict(token_cache)
+    token_cache.clear()
+    try:
+        yield
+    finally:
+        token_cache.clear()
+        token_cache.update(snapshot)
+
+
+class _FakeResponse:
+    def __init__(self, status_code: int, name: str = ""):
+        self.status_code = status_code
+        self._name = name
+
+    def json(self):
+        return {"name": self._name}
+
+
+class _FakeAsyncClient:
+    """Stands in for httpx.AsyncClient; behaviour set per test."""
+
+    response: _FakeResponse | None = None
+    error: Exception | None = None
+    calls: int = 0
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def get(self, *args, **kwargs):
+        type(self).calls += 1
+        if type(self).error is not None:
+            raise type(self).error
+        return type(self).response
+
+
+@pytest.fixture
+def _fake_whoami(monkeypatch):
+    import httpx
+
+    _FakeAsyncClient.response = None
+    _FakeAsyncClient.error = None
+    _FakeAsyncClient.calls = 0
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeAsyncClient)
+    return _FakeAsyncClient
+
+
+@pytest.mark.asyncio
+async def test_fresh_cache_hit_skips_network(_clean_token_cache, _fake_whoami):
+    token_cache["tok"] = ("alice", time.monotonic() + TOKEN_CACHE_TTL_SECONDS)
+    assert await validate_hf_token("tok") == "alice"
+    assert _fake_whoami.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_expired_entry_revalidates_and_refreshes_ttl(
+    _clean_token_cache, _fake_whoami
+):
+    token_cache["tok"] = ("alice", time.monotonic() - 1.0)
+    _fake_whoami.response = _FakeResponse(200, "alice")
+
+    assert await validate_hf_token("tok") == "alice"
+    assert _fake_whoami.calls == 1
+    assert token_cache["tok"][1] > time.monotonic(), "TTL must be refreshed"
+
+
+@pytest.mark.asyncio
+async def test_revoked_token_is_dropped_on_explicit_rejection(
+    _clean_token_cache, _fake_whoami
+):
+    """The point of the TTL: a token revoked on HF must stop working
+    within one TTL, not survive until the next Space restart.
+    """
+    token_cache["tok"] = ("alice", time.monotonic() - 1.0)
+    _fake_whoami.response = _FakeResponse(401)
+
+    assert await validate_hf_token("tok") is None
+    assert "tok" not in token_cache
+
+
+@pytest.mark.asyncio
+async def test_stale_entry_served_during_validation_outage(
+    _clean_token_cache, _fake_whoami
+):
+    """A whoami outage must degrade to stale identities, not 401 the
+    whole fleet.
+    """
+    token_cache["tok"] = ("alice", time.monotonic() - 1.0)
+    _fake_whoami.error = ConnectionError("whoami down")
+
+    assert await validate_hf_token("tok") == "alice"
+    assert "tok" in token_cache, "stale entry must survive for the next retry"
+
+
+@pytest.mark.asyncio
+async def test_unknown_token_fails_closed_during_outage(
+    _clean_token_cache, _fake_whoami
+):
+    _fake_whoami.error = ConnectionError("whoami down")
+    assert await validate_hf_token("never-seen") is None
+
+
+def test_prune_token_cache_drops_only_beyond_grace(_clean_token_cache):
+    now = time.monotonic()
+    token_cache["tok-ancient"] = ("a", now - TOKEN_CACHE_STALE_GRACE_SECONDS - 1.0)
+    token_cache["tok-stale"] = ("b", now - 10.0)  # expired but within grace
+    token_cache["tok-fresh"] = ("c", now + TOKEN_CACHE_TTL_SECONDS)
+
+    _prune_token_cache()
+
+    assert "tok-ancient" not in token_cache
+    assert "tok-stale" in token_cache
+    assert "tok-fresh" in token_cache
