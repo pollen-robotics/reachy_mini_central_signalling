@@ -1,1 +1,1 @@
-{"id":"6143ff228e4be825d6e40774c2f8bb75","fullName":"test_robot_kind#test_unusable_kind_falls_back_to_robot_type","name":"test_unusable_kind_falls_back_to_robot_type[dict]","status":"passed","testResultsByEnv":{"default":"768734169b8f9de35801e338e702a810"}}
+{"id":"6143ff228e4be825d6e40774c2f8bb75","fullName":"test_robot_kind#test_unusable_kind_falls_back_to_robot_type","name":"test_unusable_kind_falls_back_to_robot_type[None]","status":"passed","testResultsByEnv":{"default":"7f71d743e42bff0d0f5c7a38ee42d5a6"}}

@@ -1,1 +1,1 @@
-{"id":"455c03f13debc5601b6f030da189795a","fullName":"test_robot_kind#test_non_string_kind_defaults","name":"test_non_string_kind_defaults[list]","status":"passed","testResultsByEnv":{"default":"1dda9f8be2287a202aeaae1b44ab5004"}}
+{"id":"455c03f13debc5601b6f030da189795a","fullName":"test_robot_kind#test_non_string_kind_defaults","name":"test_non_string_kind_defaults[int]","status":"passed","testResultsByEnv":{"default":"db1622b0d1638fc0c708df499e75d5e5"}}
