@@ -1,0 +1,1 @@
+WARNING  app:app.py:411 [deprecation] HF token received via query string from testclient. Switch to Authorization: Bearer <token> — the query form will be removed in a future release.
