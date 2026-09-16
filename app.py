@@ -27,10 +27,15 @@ activity - never on SSE delivery, so back-pressure on a healthy
 consumer can not tear down a healthy media session (the bug that got
 the previous TTL sweeper removed).
 
-Lifecycle responsibilities (see ``reachy_mini/docs/SIGNALING.md`` for the
-canonical contract):
+Lifecycle responsibilities (this list is the canonical contract; the
+``meta`` keys the server interprets are documented in
+``docs/META_CONTRACT.md``):
 
 - Forward producer ``meta`` verbatim to listeners (no re-interpretation).
+  The only server-side reading of ``meta`` for *public* output is the
+  robot-kind classification behind the ``/health`` and status-page
+  counters (``producers_by_kind``), which collapses the untrusted
+  ``meta.kind`` into a bounded set of labels (see ``robot_kind_of``).
 - Honour ``setPeerStatus(roles=[])`` by removing the peer from
   ``producers`` immediately (the SSE channel stays open so the daemon
   can re-register without reconnecting). The daemon also uses
@@ -49,18 +54,20 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from string import Template
 from typing import Optional, AsyncGenerator
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from sse_starlette.sse import EventSourceResponse
 
 logging.basicConfig(level=logging.INFO)
@@ -103,6 +110,104 @@ PRODUCER_SWEEP_INTERVAL_SECONDS = float(
     os.getenv("REACHY_CENTRAL_PRODUCER_SWEEP_INTERVAL", "5")
 )
 RECOMMENDED_HEARTBEAT_INTERVAL_SECONDS = 10.0
+
+
+# --- Robot kinds ------------------------------------------------------
+#
+# The public counters on ``/`` and ``/health`` break producers down by
+# robot family. ``meta.kind`` is untrusted input (any authenticated HF
+# user can send any meta), so before it reaches a public surface it is
+# collapsed into a bounded-cardinality label: known values map to
+# themselves, everything else lands in ``OTHER_ROBOT_KIND``. Raw
+# ``meta`` is still forwarded verbatim on every owner-scoped path
+# (SSE ``list``, ``/api/robot-status``, ``/api/debug/peers``).
+#
+# Reachy Mini daemons send no ``kind`` at all (their meta is
+# ``{name, transport, hardware_id}``), hence the default. Micro Duck
+# registers with ``kind="microduck"`` (plus ``release``, ``api_version``).
+# See ``docs/META_CONTRACT.md``.
+KNOWN_ROBOT_KINDS = ("reachy_mini", "microduck")
+DEFAULT_ROBOT_KIND = "reachy_mini"
+OTHER_ROBOT_KIND = "other"
+# The fixed, ordered key set every public surface exposes: ``/health``
+# ``producers_by_kind`` and the status-page cards both iterate this.
+PUBLIC_ROBOT_KINDS = KNOWN_ROBOT_KINDS + (OTHER_ROBOT_KIND,)
+# A raw ``kind`` longer than this is classified as ``other`` before any
+# normalisation work is done on it.
+ROBOT_KIND_MAX_RAW_LEN = 64
+
+# Display labels for the status page. These constants are the ONLY
+# kind-related strings that ever reach the HTML: ``Template.substitute``
+# does no escaping, so nothing derived from ``meta`` may be interpolated
+# into the page.
+ROBOT_KIND_LABELS = {
+    "reachy_mini": "Reachy Mini",
+    "microduck": "Micro Duck",
+    OTHER_ROBOT_KIND: "Other",
+}
+
+# Lookup table for ``robot_kind_of``: a known kind with every
+# non-alphanumeric character removed -> the canonical kind. Lets
+# ``micro-duck``, ``Micro Duck`` and ``microduck`` all resolve to the
+# same bucket without enumerating spellings.
+_KIND_BY_COMPACT = {kind.replace("_", ""): kind for kind in KNOWN_ROBOT_KINDS}
+_KIND_NON_ALNUM = re.compile(r"[^a-z0-9]")
+
+# Start time, two clocks on purpose:
+#
+# - ``STARTED_AT`` is wall clock and is only ever *displayed* (``/health``
+#   ``started_at``, the status-page footer) so an operator can tell a
+#   fresh redeploy from a quiet fleet. It is never compared to anything.
+# - ``_STARTED_MONOTONIC`` drives ``uptime_seconds``. Like every other
+#   duration in this module it uses ``time.monotonic()`` so an NTP step
+#   cannot make uptime jump or go negative.
+STARTED_AT = datetime.now(timezone.utc)
+STARTED_AT_ISO = STARTED_AT.isoformat(timespec="seconds").replace("+00:00", "Z")
+_STARTED_MONOTONIC = time.monotonic()
+
+
+def _usable_kind(raw: object) -> bool:
+    """A kind value carries information only if it is a non-blank string."""
+    return isinstance(raw, str) and raw.strip() != ""
+
+
+def robot_kind_of(meta: object) -> str:
+    """Classify a producer's ``meta`` into a bounded robot-kind label.
+
+    Reads ``meta["kind"]``, falling back to the ``meta["robot_type"]``
+    alias when ``kind`` is not a usable value (absent, ``None``,
+    non-string or blank). If neither is usable the producer is a Reachy
+    Mini daemon (they never sent a kind) and the result is
+    ``DEFAULT_ROBOT_KIND``.
+
+    A usable value longer than ``ROBOT_KIND_MAX_RAW_LEN`` is ``other``
+    outright. Otherwise it is lower-cased, stripped of every character
+    outside ``[a-z0-9]`` and looked up against the known kinds compacted
+    the same way, so ``microduck``, ``Micro-Duck``, ``micro duck``,
+    ``reachy_mini``, ``Reachy Mini`` and ``reachymini`` all resolve to
+    their canonical kind; anything else is ``OTHER_ROBOT_KIND``.
+
+    The result is a bounded-cardinality label safe for public display:
+    an attacker-controlled ``kind`` can at most bump the ``other``
+    counter and can never inject a new key or string into ``/health``
+    or the status page. This function never raises; a non-dict ``meta``
+    is treated as empty.
+
+    This is a read-only view. The raw ``meta`` dict is left untouched
+    and still forwarded verbatim to owner-scoped listeners, so daemons
+    and apps keep seeing exactly what the producer registered.
+    """
+    if not isinstance(meta, dict):
+        return DEFAULT_ROBOT_KIND
+    raw = meta.get("kind")
+    if not _usable_kind(raw):
+        raw = meta.get("robot_type")
+    if not _usable_kind(raw):
+        return DEFAULT_ROBOT_KIND
+    if len(raw) > ROBOT_KIND_MAX_RAW_LEN:
+        return OTHER_ROBOT_KIND
+    compact = _KIND_NON_ALNUM.sub("", raw.lower())
+    return _KIND_BY_COMPACT.get(compact, OTHER_ROBOT_KIND)
 
 
 def _session_state_changed_payload(
@@ -515,7 +620,7 @@ class SignalingServer:
           payload's stable identity (``meta.install_id`` or
           ``meta.hardware_id``) collides with an existing producer
           of the same user, evict that older producer first
-          (last-writer-wins, see ``docs/SIGNALING.md``). Broadcast a
+          (last-writer-wins, see ``_evict_stable_id_collisions``). Broadcast a
           ``peerStatusChanged`` event so listeners learn about the new
           producer.
 
@@ -538,6 +643,22 @@ class SignalingServer:
         """
         roles = message.get("roles", [])
         meta = message.get("meta", {})
+        if not isinstance(meta, dict):
+            # Every downstream reader (stable-id eviction, the sweep,
+            # /api/* views, robot_kind_of) does ``meta.get(...)``; a
+            # non-object meta would either crash the sweeper loop or
+            # poison the owner's listeners. Reject it before it can
+            # replace ``peer.meta``. Same HTTP-layer 400 pattern
+            # ``send_message`` uses for malformed requests.
+            logger.warning(
+                "Rejected setPeerStatus from %s: meta must be an object, got %s",
+                peer.peer_id,
+                type(meta).__name__,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="meta must be a JSON object",
+            )
         peer.meta = meta
 
         if "producer" in roles:
@@ -694,6 +815,31 @@ class SignalingServer:
                 }
             )
         return out
+
+    def count_connected_peers(self) -> int:
+        """Number of peers (any role) whose SSE channel is currently up."""
+        return sum(1 for p in self.peers.values() if p.connected)
+
+    def count_connected_producers(self) -> int:
+        """Number of registered producers whose SSE channel is currently up.
+
+        This is the public definition of "active producer" (``/`` and
+        ``/health``) and matches what ``get_producers_list`` shows owners.
+        """
+        return sum(1 for p in self.producers.values() if p.connected)
+
+    def count_connected_producers_by_kind(self) -> dict[str, int]:
+        """Connected producers bucketed by ``robot_kind_of(meta)``.
+
+        Every key in ``PUBLIC_ROBOT_KINDS`` is always present, in that
+        order, zero-filled, so ``/health`` consumers get a stable schema
+        regardless of what is currently online.
+        """
+        counts = {kind: 0 for kind in PUBLIC_ROBOT_KINDS}
+        for p in self.producers.values():
+            if p.connected:
+                counts[robot_kind_of(p.meta)] += 1
+        return counts
 
     async def handle_start_session(self, peer: Peer, message: dict) -> dict:
         """Handle session start request."""
@@ -1128,7 +1274,27 @@ async def send_message(request: Request, token: str = Depends(_resolve_hf_token)
 # prefers-color-scheme. ``string.Template`` ($-placeholders) is used
 # instead of an f-string so CSS/JS braces need no escaping. Counters
 # are server-rendered, then kept live by a small /health poll.
-_STATUS_PAGE = Template("""<!DOCTYPE html>
+#
+# Template hygiene: every ``$`` in the source below must be a placeholder
+# filled by ``root()`` - a stray one raises ``KeyError`` at request time
+# (``substitute``, not ``safe_substitute``, on purpose: a typo must fail
+# loudly in the route test rather than ship a literal "$peers"). Write a
+# literal dollar sign as ``$$``.
+
+# One card per public robot kind, in ``PUBLIC_ROBOT_KINDS`` order (the
+# same order ``/health`` uses), generated from the constant label table
+# at import time. Both the label and the element id come from constants;
+# the ``$kind_<kind>`` placeholders are the only per-request part and
+# are filled with integers. Nothing here is derived from ``meta``.
+_KIND_CARDS_HTML = "\n".join(
+    f"""            <div class="kind">
+                <div class="kind-label">{ROBOT_KIND_LABELS[kind]}</div>
+                <div class="kind-value" id="kind-{kind}">$kind_{kind}</div>
+            </div>"""
+    for kind in PUBLIC_ROBOT_KINDS
+)
+
+_STATUS_PAGE_SOURCE = """<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="utf-8">
@@ -1183,6 +1349,16 @@ _STATUS_PAGE = Template("""<!DOCTYPE html>
         .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 12px; }
         .stats .card { margin-bottom: 0; }
         .value { font-size: 32px; font-weight: 700; letter-spacing: -0.4px; margin-top: 4px; }
+        .kinds { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: 12px; }
+        .kind {
+            display: flex; align-items: center; justify-content: space-between; gap: 12px;
+            border: 1px solid var(--divider);
+            border-left: 3px solid var(--accent);
+            border-radius: var(--radius);
+            padding: 12px 16px;
+        }
+        .kind-label { font-size: 14px; font-weight: 600; }
+        .kind-value { font-size: 24px; font-weight: 700; letter-spacing: -0.3px; }
         .overline {
             font-size: 11px; font-weight: 600; letter-spacing: 0.5px;
             text-transform: uppercase; color: var(--text-secondary);
@@ -1197,7 +1373,8 @@ _STATUS_PAGE = Template("""<!DOCTYPE html>
             font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
         }
         footer { color: var(--text-secondary); font-size: 13px; margin-top: 20px; }
-        @media (max-width: 520px) { .stats { grid-template-columns: 1fr; } }
+        footer p { margin: 0 0 4px; }
+        @media (max-width: 520px) { .stats, .kinds { grid-template-columns: 1fr; } }
     </style>
 </head>
 <body>
@@ -1222,12 +1399,18 @@ _STATUS_PAGE = Template("""<!DOCTYPE html>
             </div>
         </section>
         <section class="card">
+            <div class="overline">Robots online by kind</div>
+            <div class="kinds">
+${kind_cards}
+            </div>
+        </section>
+        <section class="card">
             <div class="overline">Endpoints</div>
             <ul>
                 <li><code>GET /events</code> - SSE stream for receiving messages</li>
                 <li><code>POST /send</code> - send messages to server</li>
                 <li><code>GET /api/robot-status</code> - busy/free status of the caller's robots</li>
-                <li><code>GET /health</code> - public counters</li>
+                <li><code>GET /health</code> - public counters, incl. <code>producers_by_kind</code> and uptime</li>
                 <li>Authentication: <code>Authorization: Bearer &lt;HF token&gt;</code></li>
             </ul>
         </section>
@@ -1241,17 +1424,40 @@ _STATUS_PAGE = Template("""<!DOCTYPE html>
             </ul>
         </section>
         <footer>
-            Implements the GStreamer WebRTC signaling protocol over HTTP/SSE.
+            <p>Up since <span id="started-at">$started_at</span>, running for <span id="uptime">$uptime</span> (counters reset on every redeploy).</p>
+            <p>Implements the GStreamer WebRTC signaling protocol over HTTP/SSE.</p>
         </footer>
     </main>
     <script>
+        // Mirrors _format_uptime() server-side so the value does not
+        // visibly change shape on the first poll.
+        function formatUptime(totalSeconds) {
+            const s = Math.max(0, Math.floor(totalSeconds));
+            const d = Math.floor(s / 86400);
+            const h = Math.floor((s % 86400) / 3600);
+            const m = Math.floor((s % 3600) / 60);
+            if (d > 0) return d + "d " + h + "h " + m + "m";
+            if (h > 0) return h + "h " + m + "m";
+            return m + "m";
+        }
         async function refresh() {
             try {
-                const response = await fetch("/health");
+                const response = await fetch("/health", { cache: "no-store" });
                 if (!response.ok) return;
                 const data = await response.json();
+                // textContent only: /health values are integers, and the
+                // per-kind keys are a fixed server-side set, but the page
+                // must never interpret any of it as markup.
                 for (const key of ["peers", "producers", "sessions"]) {
                     document.getElementById(key).textContent = data[key];
+                }
+                const byKind = data.producers_by_kind || {};
+                for (const kind of Object.keys(byKind)) {
+                    const el = document.getElementById("kind-" + kind);
+                    if (el) el.textContent = byKind[kind];
+                }
+                if (typeof data.uptime_seconds === "number") {
+                    document.getElementById("uptime").textContent = formatUptime(data.uptime_seconds);
                 }
             } catch (err) {
                 // Transient network error: keep last values, retry next tick.
@@ -1260,33 +1466,93 @@ _STATUS_PAGE = Template("""<!DOCTYPE html>
         setInterval(refresh, 3000);
     </script>
 </body>
-</html>""")
+</html>"""
+
+# Expand the constant per-kind cards once at import. ``${kind_cards}`` is
+# spelled as a Template placeholder on purpose: if this expansion ever
+# stops matching, ``substitute()`` raises KeyError and the route test
+# fails instead of the page silently shipping the raw sentinel.
+_STATUS_PAGE = Template(_STATUS_PAGE_SOURCE.replace("${kind_cards}", _KIND_CARDS_HTML))
+
+
+def _format_uptime(total_seconds: float) -> str:
+    """Human-readable uptime, e.g. ``3d 4h 12m`` / ``4h 12m`` / ``12m``.
+
+    Keep in sync with ``formatUptime`` in the status page JS.
+    """
+    s = max(0, int(total_seconds))
+    d, rem = divmod(s, 86400)
+    h, rem = divmod(rem, 3600)
+    m = rem // 60
+    if d > 0:
+        return f"{d}d {h}h {m}m"
+    if h > 0:
+        return f"{h}h {m}m"
+    return f"{m}m"
+
+
+def _public_counters() -> dict:
+    """Counters shared by ``/`` and ``/health`` - one definition, two views.
+
+    ``peers``, ``producers`` and ``producers_by_kind`` count connected
+    peers only; ``producers_by_kind`` always carries every key in
+    ``PUBLIC_ROBOT_KINDS`` (zero-filled). ``started_at`` is the wall-clock
+    start in ISO 8601 UTC; ``uptime_seconds`` is monotonic.
+    """
+    return {
+        "peers": signaling.count_connected_peers(),
+        "producers": signaling.count_connected_producers(),
+        "sessions": len(signaling.sessions),
+        "producers_by_kind": signaling.count_connected_producers_by_kind(),
+        "started_at": STARTED_AT_ISO,
+        "uptime_seconds": int(time.monotonic() - _STARTED_MONOTONIC),
+    }
 
 
 @app.get("/")
 async def root():
-    """Status page: server-rendered counters kept live by a /health poll."""
+    """Status page: server-rendered counters kept live by a /health poll.
+
+    Everything interpolated here is either an integer counter, a
+    server-side constant, or a server-generated timestamp. Nothing from
+    ``meta`` may ever be passed to ``substitute`` (no escaping).
+    """
+    counters = _public_counters()
     return HTMLResponse(
         content=_STATUS_PAGE.substitute(
-            peers=len([p for p in signaling.peers.values() if p.connected]),
-            producers=len(signaling.producers),
-            sessions=len(signaling.sessions),
+            peers=counters["peers"],
+            producers=counters["producers"],
+            sessions=counters["sessions"],
+            started_at=counters["started_at"],
+            uptime=_format_uptime(counters["uptime_seconds"]),
             rate_requests=RATE_LIMIT_REQUESTS,
             rate_window=int(RATE_LIMIT_WINDOW),
             lease=int(PRODUCER_LEASE_SECONDS),
-        )
+            **{f"kind_{k}": v for k, v in counters["producers_by_kind"].items()},
+        ),
+        headers={"Cache-Control": "no-store"},
     )
 
 
 @app.get("/health")
 async def health():
-    """Health check endpoint."""
-    return {
-        "status": "healthy",
-        "peers": len([p for p in signaling.peers.values() if p.connected]),
-        "producers": len(signaling.producers),
-        "sessions": len(signaling.sessions),
-    }
+    """Public health check and counters.
+
+    Shape (existing keys are public and must stay stable; new keys are
+    additive)::
+
+        {
+            "status": "healthy",
+            "peers": 3, "producers": 2, "sessions": 1,
+            "producers_by_kind": {"reachy_mini": 1, "microduck": 1, "other": 0},
+            "started_at": "2026-09-16T08:00:00Z",
+            "uptime_seconds": 12345
+        }
+    """
+    return JSONResponse(
+        {"status": "healthy", **_public_counters()},
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.get("/api/robot-status")
