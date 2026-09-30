@@ -1,0 +1,1 @@
+WARNING  app:app.py:1072 Sweeping stale producer 1e3cd0dd-d4f1-4659-b8bd-3b78089fa926 (name='r', silent for 31s)

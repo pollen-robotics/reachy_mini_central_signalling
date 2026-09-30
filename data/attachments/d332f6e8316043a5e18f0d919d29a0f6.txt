@@ -1,0 +1,2 @@
+INFO     fleet_usage:fleet_usage.py:980 Fleet usage bootstrapped from dataset pollen-robotics/fleet_usage_test: 1 window row(s), 0 daily row(s)
+WARNING  fleet_usage:fleet_usage.py:1052 Fleet usage publish to dataset pollen-robotics/fleet_usage_test failed (RuntimeError: 502 Bad Gateway (Authorization: Bearer ***)); 1 row(s) kept for retry

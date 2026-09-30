@@ -1,0 +1,3 @@
+WARNING  fleet_usage:fleet_usage.py:357 Fleet usage pending buffer full (5 rows): dropping the oldest row
+WARNING  fleet_usage:fleet_usage.py:357 Fleet usage pending buffer full (5 rows): dropping the oldest row
+WARNING  fleet_usage:fleet_usage.py:357 Fleet usage pending buffer full (5 rows): dropping the oldest row

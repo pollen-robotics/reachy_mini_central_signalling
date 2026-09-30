@@ -1,0 +1,2 @@
+WARNING  fleet_usage:fleet_usage.py:1213 FLEET_USAGE_WINDOW_SECONDS='7' must be a positive integer dividing 86400; using 600
+WARNING  fleet_usage:fleet_usage.py:1228 FLEET_USAGE_PUBLISH_SECONDS='0' must be a number >= 5; using 1800
