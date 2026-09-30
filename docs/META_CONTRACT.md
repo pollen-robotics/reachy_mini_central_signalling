@@ -50,7 +50,7 @@ untouched and never interpreted.
   for the public counters; it never rewrites `meta`.
 
 Adding a robot family is a one-line change to `KNOWN_ROBOT_KINDS` (and a
-label in `ROBOT_KIND_LABELS`) in `app.py`; the tests in
+label in `ROBOT_KIND_LABELS`) in `robot_kinds.py`; the tests in
 `test_robot_kind.py` and `test_routes.py` pin the behaviour above.
 
 ## Public counters (`GET /health`)
@@ -63,7 +63,8 @@ label in `ROBOT_KIND_LABELS`) in `app.py`; the tests in
   "sessions": 1,
   "producers_by_kind": {"reachy_mini": 1, "microduck": 1, "other": 0},
   "started_at": "2026-09-16T08:00:00Z",
-  "uptime_seconds": 12345
+  "uptime_seconds": 12345,
+  "usage_publisher": {"enabled": true, "last_published_at": "2026-09-16T08:30:00Z", "pending_rows": 0, "dropped_rows": 0}
 }
 ```
 
@@ -71,3 +72,5 @@ label in `ROBOT_KIND_LABELS`) in `app.py`; the tests in
 only. `started_at` / `uptime_seconds` are wall-clock and exist so an
 operator can tell a fresh redeploy (all counters reset) from a quiet
 fleet. Both `/` and `/health` are served with `Cache-Control: no-store`.
+`usage_publisher` is the fleet usage publisher's aggregate state (see
+[`FLEET_USAGE.md`](FLEET_USAGE.md)).

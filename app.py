@@ -54,7 +54,6 @@ import hashlib
 import json
 import logging
 import os
-import re
 import time
 import uuid
 from collections import deque
@@ -62,13 +61,41 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from string import Template
-from typing import Optional, AsyncGenerator
+from typing import AsyncGenerator, Optional
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from sse_starlette.sse import EventSourceResponse
+
+# Robot-kind classification lives in ``robot_kinds`` (shared with fleet
+# usage); every name is re-exported here for existing importers.
+from robot_kinds import (  # noqa: F401
+    DEFAULT_ROBOT_KIND,
+    KNOWN_ROBOT_KINDS,
+    OTHER_ROBOT_KIND,
+    PUBLIC_ROBOT_KINDS,
+    ROBOT_KIND_LABELS,
+    ROBOT_KIND_MAX_RAW_LEN,
+    robot_kind_of,
+)
+from fleet_usage import (
+    DEV_USAGE_SUMMARY_ROUTE,
+    SESSION_END_ENDED,
+    SESSION_END_OTHER,
+    SESSION_END_PEER_DISCONNECTED,
+    SESSION_END_REPLACED,
+    SESSION_END_SWEPT,
+    SESSION_END_WITHDRAWN,
+    USAGE_HOOK_ERROR_LOG_INTERVAL_SECONDS,
+    USAGE_SUMMARY_PATH,
+    UsageTracker,
+    build_usage_publisher,
+    fleet_usage_config_from_env,
+    publisher_health,
+    render_usage_section,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -112,47 +139,6 @@ PRODUCER_SWEEP_INTERVAL_SECONDS = float(
 RECOMMENDED_HEARTBEAT_INTERVAL_SECONDS = 10.0
 
 
-# --- Robot kinds ------------------------------------------------------
-#
-# The public counters on ``/`` and ``/health`` break producers down by
-# robot family. ``meta.kind`` is untrusted input (any authenticated HF
-# user can send any meta), so before it reaches a public surface it is
-# collapsed into a bounded-cardinality label: known values map to
-# themselves, everything else lands in ``OTHER_ROBOT_KIND``. Raw
-# ``meta`` is still forwarded verbatim on every owner-scoped path
-# (SSE ``list``, ``/api/robot-status``, ``/api/debug/peers``).
-#
-# Reachy Mini daemons send no ``kind`` at all (their meta is
-# ``{name, transport, hardware_id}``), hence the default. Micro Duck
-# registers with ``kind="microduck"`` (plus ``release``, ``api_version``).
-# See ``docs/META_CONTRACT.md``.
-KNOWN_ROBOT_KINDS = ("reachy_mini", "microduck")
-DEFAULT_ROBOT_KIND = "reachy_mini"
-OTHER_ROBOT_KIND = "other"
-# The fixed, ordered key set every public surface exposes: ``/health``
-# ``producers_by_kind`` and the status-page cards both iterate this.
-PUBLIC_ROBOT_KINDS = KNOWN_ROBOT_KINDS + (OTHER_ROBOT_KIND,)
-# A raw ``kind`` longer than this is classified as ``other`` before any
-# normalisation work is done on it.
-ROBOT_KIND_MAX_RAW_LEN = 64
-
-# Display labels for the status page. These constants are the ONLY
-# kind-related strings that ever reach the HTML: ``Template.substitute``
-# does no escaping, so nothing derived from ``meta`` may be interpolated
-# into the page.
-ROBOT_KIND_LABELS = {
-    "reachy_mini": "Reachy Mini",
-    "microduck": "Micro Duck",
-    OTHER_ROBOT_KIND: "Other",
-}
-
-# Lookup table for ``robot_kind_of``: a known kind with every
-# non-alphanumeric character removed -> the canonical kind. Lets
-# ``micro-duck``, ``Micro Duck`` and ``microduck`` all resolve to the
-# same bucket without enumerating spellings.
-_KIND_BY_COMPACT = {kind.replace("_", ""): kind for kind in KNOWN_ROBOT_KINDS}
-_KIND_NON_ALNUM = re.compile(r"[^a-z0-9]")
-
 # Start time, two clocks on purpose:
 #
 # - ``STARTED_AT`` is wall clock and is only ever *displayed* (``/health``
@@ -164,50 +150,6 @@ _KIND_NON_ALNUM = re.compile(r"[^a-z0-9]")
 STARTED_AT = datetime.now(timezone.utc)
 STARTED_AT_ISO = STARTED_AT.isoformat(timespec="seconds").replace("+00:00", "Z")
 _STARTED_MONOTONIC = time.monotonic()
-
-
-def _usable_kind(raw: object) -> bool:
-    """A kind value carries information only if it is a non-blank string."""
-    return isinstance(raw, str) and raw.strip() != ""
-
-
-def robot_kind_of(meta: object) -> str:
-    """Classify a producer's ``meta`` into a bounded robot-kind label.
-
-    Reads ``meta["kind"]``, falling back to the ``meta["robot_type"]``
-    alias when ``kind`` is not a usable value (absent, ``None``,
-    non-string or blank). If neither is usable the producer is a Reachy
-    Mini daemon (they never sent a kind) and the result is
-    ``DEFAULT_ROBOT_KIND``.
-
-    A usable value longer than ``ROBOT_KIND_MAX_RAW_LEN`` is ``other``
-    outright. Otherwise it is lower-cased, stripped of every character
-    outside ``[a-z0-9]`` and looked up against the known kinds compacted
-    the same way, so ``microduck``, ``Micro-Duck``, ``micro duck``,
-    ``reachy_mini``, ``Reachy Mini`` and ``reachymini`` all resolve to
-    their canonical kind; anything else is ``OTHER_ROBOT_KIND``.
-
-    The result is a bounded-cardinality label safe for public display:
-    an attacker-controlled ``kind`` can at most bump the ``other``
-    counter and can never inject a new key or string into ``/health``
-    or the status page. This function never raises; a non-dict ``meta``
-    is treated as empty.
-
-    This is a read-only view. The raw ``meta`` dict is left untouched
-    and still forwarded verbatim to owner-scoped listeners, so daemons
-    and apps keep seeing exactly what the producer registered.
-    """
-    if not isinstance(meta, dict):
-        return DEFAULT_ROBOT_KIND
-    raw = meta.get("kind")
-    if not _usable_kind(raw):
-        raw = meta.get("robot_type")
-    if not _usable_kind(raw):
-        return DEFAULT_ROBOT_KIND
-    if len(raw) > ROBOT_KIND_MAX_RAW_LEN:
-        return OTHER_ROBOT_KIND
-    compact = _KIND_NON_ALNUM.sub("", raw.lower())
-    return _KIND_BY_COMPACT.get(compact, OTHER_ROBOT_KIND)
 
 
 def _session_state_changed_payload(
@@ -236,16 +178,26 @@ def _session_state_changed_payload(
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    """Run the stale-producer sweeper for the app's lifetime."""
-    sweeper_task = asyncio.create_task(signaling.run_producer_sweeper())
+    """Run the stale-producer sweeper (and fleet usage publisher) for the app's lifetime.
+
+    On shutdown the publisher gets one last, short attempt to publish its
+    pending rows plus the partial current window and day.
+    """
+    tasks = [asyncio.create_task(signaling.run_producer_sweeper())]
+    if usage_publisher is not None:
+        tasks.append(asyncio.create_task(usage_publisher.run()))
     try:
         yield
     finally:
-        sweeper_task.cancel()
-        try:
-            await sweeper_task
-        except asyncio.CancelledError:
-            pass
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        if usage_publisher is not None:
+            await usage_publisher.final_publish()
 
 
 app = FastAPI(title="Reachy Mini Central", lifespan=_lifespan)
@@ -561,9 +513,16 @@ class Peer:
 
 
 class SignalingServer:
-    """HTTP-based WebRTC signaling server."""
+    """HTTP-based WebRTC signaling server.
 
-    def __init__(self):
+    ``usage`` (optional) receives fleet usage events through ``_track``;
+    tracking failures are logged and swallowed, never propagated into
+    signalling.
+    """
+
+    def __init__(self, usage: Optional[UsageTracker] = None):
+        self.usage = usage
+        self._usage_error_logged_at: dict[str, float] = {}
         self.peers: dict[str, Peer] = {}
         self.sessions: dict[str, tuple[str, str]] = {}  # session_id -> (producer_id, consumer_id)
         self.producers: dict[str, Peer] = {}  # producer_id -> Peer
@@ -572,6 +531,27 @@ class SignalingServer:
         # is purged on disconnect so a hard-evicted peer doesn't come
         # back with the same id.
         self.token_to_peer: dict[str, str] = {}
+
+    # ------------------------------------------------------------------
+    # Fleet usage hook
+    # ------------------------------------------------------------------
+
+    def _track(self, event: str, *args) -> None:
+        """Forward ``event`` to ``self.usage``; never raises.
+
+        A failing hook logs its traceback at most once per
+        ``USAGE_HOOK_ERROR_LOG_INTERVAL_SECONDS`` per event name.
+        """
+        if self.usage is None:
+            return
+        try:
+            getattr(self.usage, event)(*args)
+        except Exception:
+            now = time.monotonic()
+            last = self._usage_error_logged_at.get(event)
+            if last is None or now - last >= USAGE_HOOK_ERROR_LOG_INTERVAL_SECONDS:
+                self._usage_error_logged_at[event] = now
+                logger.exception("Fleet usage hook %s failed (signalling unaffected)", event)
 
     # ------------------------------------------------------------------
     # Peer lifecycle
@@ -665,6 +645,7 @@ class SignalingServer:
             await self._evict_stable_id_collisions(peer, meta)
             peer.role = "producer"
             self.producers[peer.peer_id] = peer
+            self._track("producer_seen", peer.peer_id, peer.username, meta)  # usage
             logger.info(f"Producer registered: {peer.peer_id} with meta: {meta}")
             return {
                 "type": "peerStatusChanged",
@@ -695,9 +676,14 @@ class SignalingServer:
         """
         was_producer = peer.peer_id in self.producers
         if peer.session_id is not None:
-            await self.handle_end_session(peer.session_id, reason="producer_withdrew")
+            await self.handle_end_session(
+                peer.session_id,
+                reason="producer_withdrew",
+                end_cause=SESSION_END_WITHDRAWN,
+            )
         if was_producer:
             del self.producers[peer.peer_id]
+            self._track("producer_gone", peer.peer_id)  # usage
             logger.info(
                 "Producer withdrew: %s (meta=%s)", peer.peer_id, meta
             )
@@ -762,9 +748,11 @@ class SignalingServer:
             )
             if old_peer.session_id is not None:
                 await self.handle_end_session(
-                    old_peer.session_id, reason="install_id_takeover"
+                    old_peer.session_id,
+                    reason="install_id_takeover",
+                    end_cause=SESSION_END_REPLACED,
                 )
-            await self.disconnect_peer(old_id)
+            await self.disconnect_peer(old_id, end_cause=SESSION_END_REPLACED)
 
     def producer_session_snapshot(
         self, producer: Peer
@@ -876,6 +864,7 @@ class SignalingServer:
 
         # Store session
         self.sessions[session_id] = (producer_id, peer.peer_id)
+        self._track("session_started", session_id, producer.meta)  # usage
         peer.session_id = session_id
         peer.partner_id = producer_id
         peer.role = "consumer"
@@ -930,7 +919,13 @@ class SignalingServer:
         await self.send_to_peer(target_id, relay_message)
         logger.debug(f"Relayed peer message from {peer.peer_id} to {target_id}")
 
-    async def handle_end_session(self, session_id: str, reason: Optional[str] = None):
+    async def handle_end_session(
+        self,
+        session_id: str,
+        reason: Optional[str] = None,
+        *,
+        end_cause: str = SESSION_END_OTHER,
+    ):
         """End a session and notify both peers.
 
         The optional ``reason`` is propagated to both peers so clients can
@@ -939,6 +934,10 @@ class SignalingServer:
         relay refuses because a local Python app holds the daemon lock).
         Without forwarding the reason, clients see only an unexplained
         endSession and have no way to surface a meaningful message.
+
+        ``end_cause`` is the server-side category (``SESSION_END_*``) of
+        the code path ending the session, recorded by fleet usage. It is
+        independent of ``reason``, which is client-controlled.
         """
         if session_id not in self.sessions:
             return
@@ -962,6 +961,7 @@ class SignalingServer:
                 await self.send_to_peer(peer_id, msg)
 
         del self.sessions[session_id]
+        self._track("session_ended", session_id, end_cause)  # usage
 
         # Push free transition to the user's other devices, mirror
         # of the start-session broadcast. Owner is resolved from
@@ -1024,6 +1024,7 @@ class SignalingServer:
             await self.handle_end_session(
                 message.get("sessionId"),
                 reason=message.get("reason"),
+                end_cause=SESSION_END_ENDED,
             )
             return None
 
@@ -1074,11 +1075,15 @@ class SignalingServer:
                 peer.meta.get("name") if peer else None,
                 now - peer.last_seen if peer else -1,
             )
-            await self.disconnect_peer(pid)
+            await self.disconnect_peer(pid, end_cause=SESSION_END_SWEPT)
         return stale
 
     async def run_producer_sweeper(self) -> None:
-        """Background task: periodic stale-producer sweep + cache pruning."""
+        """Background task: periodic stale-producer sweep + cache pruning.
+
+        Also rolls the fleet usage window over, so windows close on time
+        even when no signalling event arrives.
+        """
         while True:
             await asyncio.sleep(PRODUCER_SWEEP_INTERVAL_SECONDS)
             try:
@@ -1087,8 +1092,11 @@ class SignalingServer:
                 _prune_token_cache()
             except Exception:
                 logger.exception("Producer sweeper iteration failed")
+            self._track("maybe_roll")  # usage
 
-    async def disconnect_peer(self, peer_id: str):
+    async def disconnect_peer(
+        self, peer_id: str, *, end_cause: str = SESSION_END_OTHER
+    ):
         """Fully evict a peer from every server-side structure.
 
         Called from three places:
@@ -1109,6 +1117,9 @@ class SignalingServer:
         Any consumer waiting on its message_queue is signaled by the
         ``endSession`` broadcast in ``handle_end_session``; the
         message_queue itself is GC'd alongside the Peer object.
+
+        ``end_cause`` categorises the ended session (if any) for fleet
+        usage: each caller passes the one matching its path.
         """
         if peer_id not in self.peers:
             return
@@ -1120,13 +1131,14 @@ class SignalingServer:
         # handle_end_session clears session_id/partner_id on both sides and
         # notifies the remaining peer so it can tear down its WebRTC state.
         if peer.session_id is not None:
-            await self.handle_end_session(peer.session_id)
+            await self.handle_end_session(peer.session_id, end_cause=end_cause)
 
         # If we were a producer, tell same-user listeners now so their
         # UI updates without waiting for a fresh /list.
         was_producer = peer_id in self.producers
         if was_producer:
             del self.producers[peer_id]
+            self._track("producer_gone", peer_id)  # usage
 
         # Drop any token mapping pointing at this peer. A reconnect on
         # the same token will mint a fresh peer_id.
@@ -1153,8 +1165,39 @@ class SignalingServer:
         logger.info(f"Peer disconnected: {peer_id}")
 
 
-# Global signaling server instance
-signaling = SignalingServer()
+# Global instances. Fleet usage (see ``fleet_usage.py``) is always
+# tracked (cheap, in memory); it is only published when ``FLEET_USAGE``
+# configures a sink.
+FLEET_USAGE = fleet_usage_config_from_env(os.environ)
+usage = UsageTracker(window_seconds=FLEET_USAGE.window_seconds)
+usage_publisher = build_usage_publisher(FLEET_USAGE, usage)
+signaling = SignalingServer(usage=usage)
+
+
+def _register_dev_usage_route(target: FastAPI, local_dir: str) -> None:
+    """Serve ``<local_dir>/summary.json`` at ``DEV_USAGE_SUMMARY_ROUTE``.
+
+    Dev only: registered at import time solely when
+    ``FLEET_USAGE_LOCAL_DIR`` is active (which already excludes Spaces).
+    """
+    summary_path = os.path.join(local_dir, USAGE_SUMMARY_PATH)
+
+    @target.get(DEV_USAGE_SUMMARY_ROUTE, include_in_schema=False)
+    async def dev_fleet_usage_summary():
+        try:
+            with open(summary_path, "rb") as f:
+                content = f.read()
+        except FileNotFoundError:
+            raise HTTPException(status_code=404, detail="No usage summary yet")
+        return Response(
+            content=content,
+            media_type="application/json",
+            headers={"Cache-Control": "no-store"},
+        )
+
+
+if FLEET_USAGE.local_dir:
+    _register_dev_usage_route(app, FLEET_USAGE.local_dir)
 
 
 @app.get("/events")
@@ -1237,7 +1280,9 @@ async def events(request: Request, token: str = Depends(_resolve_hf_token)):
             # generator closing late must not tear down the live peer
             # that superseded it.
             if _is_current_connection():
-                await signaling.disconnect_peer(peer.peer_id)
+                await signaling.disconnect_peer(
+                    peer.peer_id, end_cause=SESSION_END_PEER_DISCONNECTED
+                )
 
     return EventSourceResponse(event_generator())
 
@@ -1273,7 +1318,8 @@ async def send_message(request: Request, token: str = Depends(_resolve_hf_token)
 # radius 12, system font stack, light/dark palettes selected via
 # prefers-color-scheme. ``string.Template`` ($-placeholders) is used
 # instead of an f-string so CSS/JS braces need no escaping. Counters
-# are server-rendered, then kept live by a small /health poll.
+# are server-rendered, then kept live by a small /health poll (every
+# ``STATUS_POLL_SECONDS``, visible tabs only).
 #
 # Template hygiene: every ``$`` in the source below must be a placeholder
 # filled by ``root()`` - a stray one raises ``KeyError`` at request time
@@ -1404,6 +1450,7 @@ _STATUS_PAGE_SOURCE = """<!DOCTYPE html>
 ${kind_cards}
             </div>
         </section>
+$usage_section
         <section class="card">
             <div class="overline">Endpoints</div>
             <ul>
@@ -1425,6 +1472,7 @@ ${kind_cards}
         </section>
         <footer>
             <p>Up since <span id="started-at">$started_at</span>, running for <span id="uptime">$uptime</span> (counters reset on every redeploy).</p>
+            <p>Live counters refresh every ${poll_seconds}s while this page is visible.</p>
             <p>Implements the GStreamer WebRTC signaling protocol over HTTP/SSE.</p>
         </footer>
     </main>
@@ -1463,7 +1511,28 @@ ${kind_cards}
                 // Transient network error: keep last values, retry next tick.
             }
         }
-        setInterval(refresh, 3000);
+        // Poll only while the tab is visible: a hidden tab costs this
+        // server nothing. Coming back refreshes at once, then resumes.
+        const POLL_MS = $poll_ms;
+        let pollTimer = null;
+        function startPolling() {
+            if (pollTimer === null) pollTimer = setInterval(refresh, POLL_MS);
+        }
+        function stopPolling() {
+            if (pollTimer !== null) {
+                clearInterval(pollTimer);
+                pollTimer = null;
+            }
+        }
+        document.addEventListener("visibilitychange", function () {
+            if (document.visibilityState === "visible") {
+                refresh();
+                startPolling();
+            } else {
+                stopPolling();
+            }
+        });
+        if (document.visibilityState === "visible") startPolling();
     </script>
 </body>
 </html>"""
@@ -1473,6 +1542,10 @@ ${kind_cards}
 # stops matching, ``substitute()`` raises KeyError and the route test
 # fails instead of the page silently shipping the raw sentinel.
 _STATUS_PAGE = Template(_STATUS_PAGE_SOURCE.replace("${kind_cards}", _KIND_CARDS_HTML))
+
+# The "Fleet usage" section depends only on operator config, so it is
+# rendered once at import ("" when no usage source is configured).
+_USAGE_SECTION_HTML = render_usage_section(FLEET_USAGE)
 
 
 def _format_uptime(total_seconds: float) -> str:
@@ -1509,15 +1582,60 @@ def _public_counters() -> dict:
     }
 
 
+# Public-page load bound. Every open status-page tab polls ``/health``;
+# the body (counters walk every producer) is computed at most once per
+# ``HEALTH_CACHE_SECONDS`` and the same dict is served to every caller in
+# that window, so N viewers cost one computation per window, not N.
+# ``Cache-Control: no-store`` stays on the responses: this server-side
+# cache is what bounds the work, and a proxy/browser cache would only
+# add staleness on top. The status page itself polls every
+# ``STATUS_POLL_SECONDS`` and only while its tab is visible.
+HEALTH_CACHE_SECONDS = 2.0
+STATUS_POLL_SECONDS = 15
+
+# (computed_at monotonic, body) or None. Single event loop and no await
+# between check and store, so no lock is needed.
+_health_cache: Optional[tuple[float, dict]] = None
+
+
+def _health_cache_reset() -> None:
+    """Drop the cached ``/health`` body (tests; next call recomputes)."""
+    global _health_cache
+    _health_cache = None
+
+
+def _cached_health_body(now: Optional[float] = None) -> dict:
+    """The ``/health`` body, recomputed at most once per ``HEALTH_CACHE_SECONDS``.
+
+    Shared by ``/health`` and ``/`` (which reads the counter keys). The
+    returned dict is shared between callers and must not be mutated.
+    ``now`` (monotonic seconds) is injectable for tests.
+    """
+    global _health_cache
+    if now is None:
+        now = time.monotonic()
+    cached = _health_cache
+    if cached is not None and 0 <= now - cached[0] < HEALTH_CACHE_SECONDS:
+        return cached[1]
+    body = {
+        "status": "healthy",
+        **_public_counters(),
+        "usage_publisher": publisher_health(usage, usage_publisher),
+    }
+    _health_cache = (now, body)
+    return body
+
+
 @app.get("/")
 async def root():
     """Status page: server-rendered counters kept live by a /health poll.
 
     Everything interpolated here is either an integer counter, a
-    server-side constant, or a server-generated timestamp. Nothing from
+    server-side constant, a server-generated timestamp, or the fleet
+    usage section built from validated operator config. Nothing from
     ``meta`` may ever be passed to ``substitute`` (no escaping).
     """
-    counters = _public_counters()
+    counters = _cached_health_body()
     return HTMLResponse(
         content=_STATUS_PAGE.substitute(
             peers=counters["peers"],
@@ -1528,6 +1646,9 @@ async def root():
             rate_requests=RATE_LIMIT_REQUESTS,
             rate_window=int(RATE_LIMIT_WINDOW),
             lease=int(PRODUCER_LEASE_SECONDS),
+            usage_section=_USAGE_SECTION_HTML,
+            poll_ms=int(STATUS_POLL_SECONDS * 1000),
+            poll_seconds=int(STATUS_POLL_SECONDS),
             **{f"kind_{k}": v for k, v in counters["producers_by_kind"].items()},
         ),
         headers={"Cache-Control": "no-store"},
@@ -1546,13 +1667,24 @@ async def health():
             "peers": 3, "producers": 2, "sessions": 1,
             "producers_by_kind": {"reachy_mini": 1, "microduck": 1, "other": 0},
             "started_at": "2026-09-16T08:00:00Z",
-            "uptime_seconds": 12345
+            "uptime_seconds": 12345,
+            "usage_publisher": {
+                "enabled": true,
+                "last_published_at": "2026-09-16T08:30:00Z",
+                "pending_rows": 0,
+                "dropped_rows": 0
+            }
         }
+
+    ``usage_publisher`` is the fleet usage publisher's aggregate state
+    (``enabled`` false when no sink is configured; ``last_published_at``
+    null until the first successful publish) - the only outside view of a
+    stalled publisher.
+
+    The body is served from a micro-cache (``HEALTH_CACHE_SECONDS``), so
+    values may lag live state by up to that long.
     """
-    return JSONResponse(
-        {"status": "healthy", **_public_counters()},
-        headers={"Cache-Control": "no-store"},
-    )
+    return JSONResponse(_cached_health_body(), headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/robot-status")
