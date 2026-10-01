@@ -46,7 +46,9 @@ Lifecycle responsibilities (this list is the canonical contract; the
   never coexists with its own ghost.
 - Honour explicit ``endSession`` messages (daemon shutdown, user
   disconnect, ``robot_busy_local_app``, etc.) and clean up on SSE
-  channel close.
+  channel close - after a short reconnect grace
+  (``SSE_RECONNECT_GRACE_SECONDS``) during which a peer whose SSE stream
+  was cut stays registered and can resume with the same peerId.
 """
 
 import asyncio
@@ -54,6 +56,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from collections import deque
@@ -61,9 +64,8 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from string import Template
-from typing import AsyncGenerator, Optional
+from typing import AsyncGenerator, Callable, Optional
 
-import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, Response
@@ -80,8 +82,10 @@ from robot_kinds import (  # noqa: F401
     ROBOT_KIND_MAX_RAW_LEN,
     robot_kind_of,
 )
+import hf_auth
 from fleet_usage import (
     DEV_USAGE_SUMMARY_ROUTE,
+    SESSION_END_CONSUMER_REPLACED,
     SESSION_END_ENDED,
     SESSION_END_OTHER,
     SESSION_END_PEER_DISCONNECTED,
@@ -97,7 +101,115 @@ from fleet_usage import (
     render_usage_section,
 )
 
-logging.basicConfig(level=logging.INFO)
+# --- Logging ----------------------------------------------------------
+#
+# HF's Space log view has no timestamps of its own and only keeps a short
+# tail, so every line carries an ISO-8601 UTC timestamp, e.g.
+# ``2026-10-01T08:21:20Z INFO app: ...``. The ``gmtime`` converter (set
+# for every formatter, uvicorn's included) makes the trailing ``Z`` true
+# regardless of the container's TZ.
+LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+LOG_DATEFMT = "%Y-%m-%dT%H:%M:%SZ"
+logging.Formatter.converter = time.gmtime
+
+
+def _timestamp_uvicorn_loggers() -> None:
+    """Prefix uvicorn's own (access + error) log lines with the UTC timestamp.
+
+    ``uvicorn`` configures its loggers from its default dict config BEFORE
+    it imports this module, so the handlers already exist here. Only
+    handlers still using uvicorn's stock formatter (no ``asctime``) are
+    touched: an operator-supplied ``--log-config`` is left alone.
+    """
+    from uvicorn.logging import ColourizedFormatter
+
+    for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+        for handler in logging.getLogger(name).handlers:
+            current = handler.formatter
+            if not isinstance(current, ColourizedFormatter):
+                continue
+            fmt = getattr(current, "_fmt", None) or "%(message)s"
+            if "asctime" in fmt:
+                continue
+            handler.setFormatter(
+                type(current)(
+                    fmt="%(asctime)s " + fmt,
+                    datefmt=LOG_DATEFMT,
+                    use_colors=current.use_colors,
+                )
+            )
+
+
+_TOKEN_QUERY_RE = re.compile(r"([?&](?:token|access_token)=)[^&#\s]*", re.IGNORECASE)
+
+
+def _redact_token_query(path: str) -> str:
+    """``/x?token=hf_abc&y=1`` -> ``/x?token=***&y=1``."""
+    return _TOKEN_QUERY_RE.sub(r"\1***", path)
+
+
+class _AccessLogFilter(logging.Filter):
+    """Filter on ``uvicorn.access``: redact tokens, drop routine 2xx lines.
+
+    - Legacy clients still send ``?token=hf_...``; the query value is
+      replaced by ``***`` so it never reaches the Space logs.
+    - Successful heartbeats (``POST /send``) and status polls
+      (``GET /api/robot-status``) are ~30 lines/s for the fleet and
+      carry no information, so 2xx lines for exactly those two routes
+      are dropped (and counted: ``access_log_filtered`` on the per-minute
+      auth summary). Every non-2xx line and every other route is kept.
+
+    Relies on uvicorn's access record shape
+    ``(client_addr, method, full_path, http_version, status_code)``;
+    any other record only gets its rendered message redacted.
+    """
+
+    QUIET_2XX_ROUTES = frozenset({("POST", "/send"), ("GET", "/api/robot-status")})
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.filtered = 0
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if isinstance(args, tuple) and len(args) == 5:
+            client_addr, method, full_path, http_version, status_code = args
+            path = str(full_path)
+            if (
+                isinstance(status_code, int)
+                and 200 <= status_code < 300
+                and (method, path.split("?", 1)[0]) in self.QUIET_2XX_ROUTES
+            ):
+                self.filtered += 1
+                return False
+            if "?" in path:
+                record.args = (client_addr, method, _redact_token_query(path), http_version, status_code)
+            return True
+        message = record.getMessage()
+        if "token=" in message.lower():
+            record.msg, record.args = _redact_token_query(message), None
+        return True
+
+
+logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, datefmt=LOG_DATEFMT)
+_timestamp_uvicorn_loggers()
+_access_log_filter = _AccessLogFilter()
+logging.getLogger("uvicorn.access").addFilter(_access_log_filter)
+
+
+class _DropWhoamiRequestLines(logging.Filter):
+    """Drop httpx's per-request INFO line for whoami calls.
+
+    httpx logs every request at INFO ("HTTP Request: GET .../whoami-v2
+    401"). Those calls are counted by ``hf_auth`` and summarised once a
+    minute, so the per-call line is pure noise.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.levelno > logging.INFO or "/api/whoami-v2" not in record.getMessage()
+
+
+logging.getLogger("httpx").addFilter(_DropWhoamiRequestLines())
 logger = logging.getLogger(__name__)
 
 
@@ -137,6 +249,52 @@ PRODUCER_SWEEP_INTERVAL_SECONDS = float(
     os.getenv("REACHY_CENTRAL_PRODUCER_SWEEP_INTERVAL", "5")
 )
 RECOMMENDED_HEARTBEAT_INTERVAL_SECONDS = 10.0
+
+# SSE reconnect grace. Hugging Face's ingress periodically cuts SSE
+# connections from the outside (whole ingress pools at once, roughly
+# every 2 h in production); robots come back on the same token after
+# their 5 s relay backoff, ~5-9 s later. Evicting on every cut made
+# 50-150 robots vanish from listings and counters for those seconds.
+#
+# Instead, when a peer's CURRENT SSE stream closes it is only *detached*
+# (``Peer.detached_at``): it stays registered, listed and counted, and
+# messages addressed to it are queued. A reconnect on the same token
+# within the grace rebinds to the same Peer (same peerId), clears the
+# detach and flushes the queue after the usual welcome + list. If the
+# grace runs out (``Peer.grace_deadline``), the sweeper evicts it
+# through ``disconnect_peer`` exactly like an SSE close used to (end
+# cause ``peer_disconnected``), so expiry lands within grace + one
+# sweep interval.
+#
+# Sessions of a detaching peer (chosen from the clients' reconnect
+# behaviour, see the README "Liveness" section): a detaching PRODUCER's
+# session ends at detach, exactly as an SSE close ended it before (same
+# broadcasts, same ``peer_disconnected`` end cause) - the daemon relay
+# tears down its local WebRTC sessions and forgets their ids whenever
+# its SSE drops, and never tells central, so keeping the session would
+# only leave a phantom busy lock. A detaching CONSUMER's session
+# survives the grace: its media is peer-to-peer and outlives the SSE
+# channel, and the clients that do restart end their old session
+# themselves.
+#
+# 0 disables the grace: an SSE close evicts immediately, as before. The
+# few behaviours that are NOT grace-specific stay active at 0 (see the
+# README): a consumer's startSession on the robot it already holds
+# replaces its own session, a stream that dies during its welcome/list
+# handshake is cleaned up, a peer's POSTed endSession purges stale
+# endSession frames for that session from its own queue, and a POST
+# racing an eviction no longer re-registers the evicted peer.
+SSE_RECONNECT_GRACE_SECONDS = max(
+    0.0, float(os.getenv("REACHY_CENTRAL_SSE_GRACE_SECONDS", "15"))
+)
+
+# Session ids a peer ended itself, remembered (per peer, bounded) so
+# stale ``endSession`` frames for them can be dropped from its queue.
+SELF_ENDED_SESSIONS_MAX = 16
+
+# Detach / reattach / expiry are summarised in one INFO line per
+# interval (only when something happened); per-peer lines are DEBUG.
+SSE_SUMMARY_LOG_INTERVAL_SECONDS = 60.0
 
 
 # Start time, two clocks on purpose:
@@ -180,7 +338,9 @@ def _session_state_changed_payload(
 async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Run the stale-producer sweeper (and fleet usage publisher) for the app's lifetime.
 
-    On shutdown the publisher gets one last, short attempt to publish its
+    On shutdown in-flight whoami calls are cancelled and the shared whoami
+    HTTP client is closed (bounded by ``WHOAMI_SHUTDOWN_TIMEOUT_SECONDS``),
+    then the publisher always gets one last, short attempt to publish its
     pending rows plus the partial current window and day.
     """
     tasks = [asyncio.create_task(signaling.run_producer_sweeper())]
@@ -196,6 +356,17 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 await task
             except asyncio.CancelledError:
                 pass
+        try:
+            await asyncio.wait_for(
+                hf_validator.aclose(), timeout=WHOAMI_SHUTDOWN_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "whoami client shutdown timed out after %.0fs; continuing",
+                WHOAMI_SHUTDOWN_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            logger.exception("whoami client shutdown failed; continuing")
         if usage_publisher is not None:
             await usage_publisher.final_publish()
 
@@ -217,18 +388,36 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Cache for validated tokens: token -> (username, expires_at monotonic).
+# --- Token validation -------------------------------------------------
 #
-# Entries expire after ``TOKEN_CACHE_TTL_SECONDS`` so a token revoked on
-# HuggingFace stops working here within the TTL instead of surviving
-# until the next Space restart. Expired entries are kept around (and
-# lazily re-validated) so that a transient whoami outage degrades to
-# serving the stale identity rather than 401-ing the whole fleet; only
-# an explicit rejection from HF drops the entry. Entries stale for more
-# than ``TOKEN_CACHE_STALE_GRACE_SECONDS`` are pruned by the sweeper.
-TOKEN_CACHE_TTL_SECONDS = 3600.0
-TOKEN_CACHE_STALE_GRACE_SECONDS = 86400.0
-token_cache: dict[str, tuple[str, float]] = {}
+# Caches, single-flight, the unknown-token budget and the shared whoami
+# client live in ``hf_auth`` (see its module docstring). One validator
+# per process; the names below are what routes and tests use.
+TOKEN_CACHE_TTL_SECONDS = hf_auth.TOKEN_CACHE_TTL_SECONDS
+TOKEN_CACHE_STALE_GRACE_SECONDS = hf_auth.TOKEN_CACHE_STALE_GRACE_SECONDS
+TokenValidationUnavailable = hf_auth.TokenValidationUnavailable
+# Bounds the lifespan's whoami shutdown so fleet usage's final publish
+# always gets its turn.
+WHOAMI_SHUTDOWN_TIMEOUT_SECONDS = 5.0
+
+hf_validator = hf_auth.TokenValidator(
+    summary_extras=lambda: {"access_log_filtered": _access_log_filter.filtered}
+)
+token_cache = hf_validator.token_cache
+
+
+async def validate_hf_token(token: str) -> Optional[str]:
+    """Username for ``token``, None if HF rejected it (see ``hf_auth``).
+
+    Raises ``TokenValidationUnavailable`` (503 + Retry-After) for a
+    never-seen token when no verdict is available right now.
+    """
+    return await hf_validator.validate(token)
+
+
+def _prune_token_cache() -> None:
+    hf_validator.prune()
+
 
 # Local-testing escape hatch: pre-seed the token cache from the
 # environment so a second client can authenticate without a real HF
@@ -243,20 +432,12 @@ if not os.environ.get("SPACE_ID"):
     for _seed in os.environ.get("DEV_TOKEN_SEED", "").split(","):
         if ":" in _seed:
             _tok, _user = _seed.split(":", 1)
-            token_cache[_tok.strip()] = (_user.strip(), float("inf"))
+            hf_validator.seed(_tok.strip(), _user.strip())
 elif os.environ.get("DEV_TOKEN_SEED"):
     logger.warning(
         "DEV_TOKEN_SEED is set but ignored: refusing to seed the token "
         "cache on a deployed Space."
     )
-
-
-def _prune_token_cache() -> None:
-    """Drop cache entries whose stale-serving grace has fully elapsed."""
-    now = time.monotonic()
-    for tok, (_, expires_at) in list(token_cache.items()):
-        if now > expires_at + TOKEN_CACHE_STALE_GRACE_SECONDS:
-            del token_cache[tok]
 
 
 # --- Rate limiting --------------------------------------------------
@@ -417,74 +598,6 @@ async def _resolve_hf_token(
     )
 
 
-async def validate_hf_token(token: str) -> Optional[str]:
-    """Validate HuggingFace token and return username if valid.
-
-    Fresh cache hits are served directly. Expired entries trigger a
-    re-validation against whoami; on transient failure (network,
-    HF outage) the stale identity is served rather than failing the
-    caller, and only an explicit non-200 from HF (revoked / invalid
-    token) drops the entry.
-    """
-    if not token:
-        return None
-
-    cached = token_cache.get(token)
-    if cached is not None and time.monotonic() < cached[1]:
-        return cached[0]
-
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                "https://huggingface.co/api/whoami-v2",
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=10.0
-            )
-
-            if response.status_code == 200:
-                data = response.json()
-                username = data.get("name", "unknown")
-                token_cache[token] = (
-                    username,
-                    time.monotonic() + TOKEN_CACHE_TTL_SECONDS,
-                )
-                logger.info(f"Token validated for user: {username}")
-                return username
-
-            if response.status_code in (401, 403):
-                # Explicit rejection: the token is revoked or invalid.
-                # This is the ONLY case that may drop a cache entry.
-                logger.warning(
-                    f"Token rejected by HF: {response.status_code}"
-                )
-                token_cache.pop(token, None)
-                return None
-
-            # 429 / 5xx: HF is unhappy, not the token. Treat like a
-            # network failure and serve the stale identity if we have
-            # one. Confusing a whoami 429 with a revocation would let
-            # an attacker who exhausts our whoami quota (by spraying
-            # invalid tokens, which are validated pre-rate-limit) turn
-            # HF rate-limiting into fleet-wide 401s at the hourly
-            # re-validation.
-            logger.warning(
-                f"Token validation inconclusive (HF {response.status_code})"
-            )
-            if cached is not None:
-                return cached[0]
-            return None
-    except Exception as e:
-        logger.error(f"Error validating token: {e}")
-        if cached is not None:
-            logger.warning(
-                "Serving stale token cache entry for user %s during "
-                "validation outage",
-                cached[0],
-            )
-            return cached[0]
-        return None
-
-
 @dataclass
 class Peer:
     """Represents a connected peer (robot or client).
@@ -499,6 +612,20 @@ class Peer:
     reconnect on the same token supersedes the previous generator:
     the old one compares its captured generation against this counter
     and exits without evicting the peer (see the /events endpoint).
+
+    ``detached_at`` (monotonic, server clock) is set while the peer's
+    SSE stream is closed but the reconnect grace has not run out yet
+    (see ``SSE_RECONNECT_GRACE_SECONDS``); ``None`` while attached. A
+    detached peer is still registered, listed and counted.
+
+    ``grace_deadline`` (same clock) is when the sweeper evicts the peer
+    unless an SSE stream of it starts first. Set at detach, and (re)armed
+    whenever a new SSE connection is bound but has not started streaming
+    yet; cleared when a stream starts. ``None`` while a stream is live.
+
+    ``self_ended_sessions`` remembers (bounded) the session ids this peer
+    ended itself, so stale ``endSession`` frames for them are never
+    replayed to it after a reconnect.
     """
     peer_id: str
     username: str
@@ -510,6 +637,11 @@ class Peer:
     partner_id: Optional[str] = None
     last_seen: float = field(default_factory=time.monotonic)
     sse_generation: int = 0
+    detached_at: Optional[float] = None
+    grace_deadline: Optional[float] = None
+    self_ended_sessions: deque = field(
+        default_factory=lambda: deque(maxlen=SELF_ENDED_SESSIONS_MAX)
+    )
 
 
 class SignalingServer:
@@ -518,10 +650,39 @@ class SignalingServer:
     ``usage`` (optional) receives fleet usage events through ``_track``;
     tracking failures are logged and swallowed, never propagated into
     signalling.
+
+    ``sse_grace_seconds`` defaults to ``SSE_RECONNECT_GRACE_SECONDS``
+    read at construction time. ``clock`` (monotonic seconds) drives
+    detach timestamps and grace deadlines only; it is injectable for
+    tests.
     """
 
-    def __init__(self, usage: Optional[UsageTracker] = None):
+    def __init__(
+        self,
+        usage: Optional[UsageTracker] = None,
+        *,
+        sse_grace_seconds: Optional[float] = None,
+        clock: Callable[[], float] = time.monotonic,
+    ):
         self.usage = usage
+        self.sse_grace_seconds = max(
+            0.0,
+            SSE_RECONNECT_GRACE_SECONDS if sse_grace_seconds is None else float(sse_grace_seconds),
+        )
+        self.clock = clock
+        # Since-boot SSE grace counters (``/health`` ``sse``), plus the
+        # snapshot the per-minute summary line diffs against.
+        self.sse_stats: dict[str, float] = {
+            "detach_total": 0,
+            "reattach_total": 0,
+            "grace_expired_total": 0,
+            "reattach_latency_s_max": 0.0,
+            "sessions_ended_at_detach_total": 0,
+            "consumer_session_replaced_total": 0,
+        }
+        self._sse_summary_at = clock()
+        self._sse_summary_snapshot = dict(self.sse_stats)
+        self._sse_summary_latency_max = 0.0
         self._usage_error_logged_at: dict[str, float] = {}
         self.peers: dict[str, Peer] = {}
         self.sessions: dict[str, tuple[str, str]] = {}  # session_id -> (producer_id, consumer_id)
@@ -566,7 +727,14 @@ class SignalingServer:
                 peer = self.peers[peer_id]
                 peer.connected = True
                 peer.last_seen = time.monotonic()
-                logger.info(f"Peer reconnected: {peer_id}")
+                # A reattach within the SSE grace is routine (summarised
+                # once a minute); only a takeover of a live connection
+                # is worth an INFO line.
+                logger.log(
+                    logging.DEBUG if peer.detached_at is not None else logging.INFO,
+                    "Peer reconnected: %s",
+                    peer_id,
+                )
                 return peer
 
         # Create new peer
@@ -576,6 +744,262 @@ class SignalingServer:
         self.token_to_peer[token] = peer_id
         logger.info(f"New peer created: {peer_id} for user {username}")
         return peer
+
+    # ------------------------------------------------------------------
+    # SSE attach / detach (reconnect grace)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _purge_queued(peer: Peer, session_id: str, types: Optional[tuple] = None) -> int:
+        """Drop queued frames for ``session_id`` (optionally only ``types``) from ``peer``'s queue.
+
+        Synchronous (no await between drain and refill), order preserved.
+        Returns how many frames were dropped.
+        """
+        kept, dropped = [], 0
+        queue = peer.message_queue
+        while True:
+            try:
+                msg = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if (
+                isinstance(msg, dict)
+                and msg.get("sessionId") == session_id
+                and (types is None or msg.get("type") in types)
+            ):
+                dropped += 1
+            else:
+                kept.append(msg)
+        for msg in kept:
+            queue.put_nowait(msg)
+        return dropped
+
+    def remember_self_ended_session(self, peer: Peer, session_id: Optional[str]) -> None:
+        """``peer`` ended (or replaced) ``session_id`` itself: never replay an endSession for it."""
+        if not isinstance(session_id, str) or not session_id:
+            return
+        if session_id not in peer.self_ended_sessions:
+            peer.self_ended_sessions.append(session_id)
+        self._purge_queued(peer, session_id, ("endSession",))
+
+    def attach_sse(self, peer: Peer) -> tuple[int, asyncio.Queue]:
+        """Bind a new SSE connection to ``peer``; return ``(generation, queue)``.
+
+        Called by ``/events`` (through ``connect_sse``) before it returns
+        the stream. Bumps ``sse_generation`` (superseding any older
+        generator) and gives the connection a fresh queue. With the grace
+        enabled, any message still sitting in the previous queue -
+        typically queued while the peer was detached - is carried over in
+        order, so it is delivered right after the new connection's
+        welcome + list; ``endSession`` frames for sessions that are over
+        and that the peer ended itself are dropped on the way. With the
+        grace disabled the old queue is dropped (previous behaviour). The
+        carry-over is synchronous: a superseded generator still awaiting
+        the old queue can not steal an item from it.
+
+        With the grace enabled this also (re)arms ``grace_deadline`` to
+        now + grace: a detached peer stays detached until the new stream
+        actually starts (``sse_stream_started``), and an attached peer
+        whose stream is superseded by one that never starts is not
+        stranded - either way the sweeper evicts it when the deadline
+        passes. Re-arming on reattach means a reconnect in progress at the
+        very end of the grace is not expired before its first step.
+        """
+        peer.sse_generation += 1
+        old_queue = peer.message_queue
+        queue: asyncio.Queue = asyncio.Queue()
+        if self.sse_grace_seconds > 0:
+            while True:
+                try:
+                    msg = old_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if (
+                    isinstance(msg, dict)
+                    and msg.get("type") == "endSession"
+                    and msg.get("sessionId") in peer.self_ended_sessions
+                    and msg.get("sessionId") not in self.sessions
+                ):
+                    continue
+                queue.put_nowait(msg)
+            peer.grace_deadline = self.clock() + self.sse_grace_seconds
+        peer.message_queue = queue
+        return peer.sse_generation, queue
+
+    async def connect_sse(self, peer: Peer) -> tuple[int, asyncio.Queue]:
+        """``attach_sse`` plus the takeover rule, for ``/events``.
+
+        When a new stream supersedes a producer's stream that is still
+        attached (its old socket half-open behind the proxy), the daemon
+        relay that reconnects has already dropped its local sessions, so
+        with the grace enabled its session ends here exactly as at
+        detach (see ``_end_session_at_detach``).
+        """
+        superseded_attached = peer.sse_generation > 0 and peer.detached_at is None
+        generation, queue = self.attach_sse(peer)
+        if (
+            superseded_attached
+            and self.sse_grace_seconds > 0
+            and self._is_producer_side_of_session(peer)
+        ):
+            await self._end_session_at_detach(peer)
+        return generation, queue
+
+    def sse_stream_started(self, peer: Peer) -> None:
+        """The peer's current SSE stream started: reattach it if detached.
+
+        Clears the pending grace deadline. Same Peer, same peerId; for a
+        detached peer the reattach latency is recorded.
+        """
+        peer.grace_deadline = None
+        if peer.detached_at is None:
+            return
+        latency = max(0.0, self.clock() - peer.detached_at)
+        peer.detached_at = None
+        self.sse_stats["reattach_total"] += 1
+        if latency > self.sse_stats["reattach_latency_s_max"]:
+            self.sse_stats["reattach_latency_s_max"] = latency
+        if latency > self._sse_summary_latency_max:
+            self._sse_summary_latency_max = latency
+        logger.debug("SSE reattach: %s after %.1fs", peer.peer_id, latency)
+
+    def _is_producer_side_of_session(self, peer: Peer) -> bool:
+        producer_id, _consumer_id = self.sessions.get(peer.session_id, (None, None))
+        return producer_id is not None and producer_id == peer.peer_id
+
+    async def _end_session_at_detach(self, peer: Peer) -> None:
+        """End a producer's session because its SSE stream went away.
+
+        Same outcome as an SSE close before the grace existed (end cause
+        ``peer_disconnected``, endSession to the consumer, busy=false
+        broadcast), except that nothing about the session is left queued
+        for the producer: its relay already dropped the session, and a
+        replayed startSession/endSession for it could only confuse it.
+        """
+        session_id = peer.session_id
+        self._purge_queued(peer, session_id)
+        self.sse_stats["sessions_ended_at_detach_total"] += 1
+        await self.handle_end_session(
+            session_id,
+            end_cause=SESSION_END_PEER_DISCONNECTED,
+            skip_notify=peer.peer_id,
+        )
+
+    async def detach_peer(self, peer_id: str) -> None:
+        """The peer's current SSE stream closed: start its reconnect grace.
+
+        With the grace disabled (``sse_grace_seconds == 0``) this is the
+        previous behaviour: immediate ``disconnect_peer`` with end cause
+        ``peer_disconnected``.
+
+        Otherwise the peer stays in ``peers`` / ``producers`` /
+        ``token_to_peer`` (still listed and counted, no removal
+        broadcast, no fleet usage event) until ``grace_deadline``. If it
+        is the producer side of a session, that session ends now (see
+        ``_end_session_at_detach``); a consumer's session survives the
+        grace.
+        """
+        peer = self.peers.get(peer_id)
+        if peer is None:
+            return
+        if self.sse_grace_seconds <= 0:
+            await self.disconnect_peer(peer_id, end_cause=SESSION_END_PEER_DISCONNECTED)
+            return
+        if peer.detached_at is not None:
+            return
+        now = self.clock()
+        peer.detached_at = now
+        peer.grace_deadline = now + self.sse_grace_seconds
+        self.sse_stats["detach_total"] += 1
+        logger.debug("SSE detach: %s (grace %.0fs)", peer_id, self.sse_grace_seconds)
+        if self._is_producer_side_of_session(peer):
+            await self._end_session_at_detach(peer)
+
+    async def expire_detached_peers(self) -> list[str]:
+        """Evict peers whose grace deadline passed; return their ids.
+
+        Covers detached peers and peers whose newest SSE connection never
+        started streaming. Runs from the sweeper before the stale-producer
+        sweep (which skips detached peers), so a detached peer is only
+        ever evicted here - or earlier by a stable-id collision that
+        removes it outright - and never processed twice. Eviction is the
+        regular ``disconnect_peer`` with end cause ``peer_disconnected``:
+        the same broadcasts, fleet usage events and cleanup an SSE close
+        produced before the grace existed. Each peer is handled in its
+        own try/except, and its deadline is cleared (and the expiry
+        counted) before ``disconnect_peer`` runs, so a failure can
+        neither skip the other peers nor count one twice.
+        """
+        if self.sse_grace_seconds <= 0:
+            return []
+        now = self.clock()
+        expired = [
+            pid
+            for pid, p in self.peers.items()
+            if p.grace_deadline is not None and now >= p.grace_deadline
+        ]
+        for pid in expired:
+            peer = self.peers.get(pid)
+            if peer is None or peer.grace_deadline is None:
+                continue
+            peer.grace_deadline = None
+            self.sse_stats["grace_expired_total"] += 1
+            logger.debug("SSE grace expired: %s", pid)
+            try:
+                await self.disconnect_peer(pid, end_cause=SESSION_END_PEER_DISCONNECTED)
+            except Exception:
+                logger.exception("SSE grace expiry failed for one peer; continuing")
+        return expired
+
+    def count_detached_peers(self) -> int:
+        return sum(1 for p in self.peers.values() if p.detached_at is not None)
+
+    def sse_health(self) -> dict:
+        """Aggregate SSE grace state for ``/health`` (no identifiers)."""
+        return {
+            "grace_seconds": self.sse_grace_seconds,
+            "detached_now": self.count_detached_peers(),
+            "detach_total": int(self.sse_stats["detach_total"]),
+            "reattach_total": int(self.sse_stats["reattach_total"]),
+            "grace_expired_total": int(self.sse_stats["grace_expired_total"]),
+            "reattach_latency_s_max": round(self.sse_stats["reattach_latency_s_max"], 2),
+            "sessions_ended_at_detach_total": int(self.sse_stats["sessions_ended_at_detach_total"]),
+            "consumer_session_replaced_total": int(self.sse_stats["consumer_session_replaced_total"]),
+        }
+
+    def maybe_log_sse_summary(self, now: Optional[float] = None) -> bool:
+        """Once per ``SSE_SUMMARY_LOG_INTERVAL_SECONDS``, one INFO line of deltas.
+
+        Silent when nothing was detached, reattached or expired in the
+        interval and nobody is detached right now. Returns whether a line
+        was logged. Aggregate counts only.
+        """
+        if now is None:
+            now = self.clock()
+        if now - self._sse_summary_at < SSE_SUMMARY_LOG_INTERVAL_SECONDS:
+            return False
+        keys = ("detach_total", "reattach_total", "grace_expired_total")
+        delta = {k: int(self.sse_stats[k] - self._sse_summary_snapshot.get(k, 0)) for k in keys}
+        window = now - self._sse_summary_at
+        latency_max = self._sse_summary_latency_max
+        detached_now = self.count_detached_peers()
+        self._sse_summary_at = now
+        self._sse_summary_snapshot = dict(self.sse_stats)
+        self._sse_summary_latency_max = 0.0
+        if not (any(delta.values()) or detached_now):
+            return False
+        logger.info(
+            "SSE summary (last %.0fs): detached=%d reattached=%d grace_expired=%d "
+            "detached_now=%d reattach_latency_max=%.1fs",
+            window,
+            delta["detach_total"],
+            delta["reattach_total"],
+            delta["grace_expired_total"],
+            detached_now,
+            latency_max,
+        )
+        return True
 
     async def send_to_peer(self, peer_id: str, message: dict):
         """Queue a message for a peer."""
@@ -639,6 +1063,8 @@ class SignalingServer:
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="meta must be a JSON object",
             )
+        was_producer = self.producers.get(peer.peer_id) is peer
+        prev_meta = peer.meta
         peer.meta = meta
 
         if "producer" in roles:
@@ -646,7 +1072,14 @@ class SignalingServer:
             peer.role = "producer"
             self.producers[peer.peer_id] = peer
             self._track("producer_seen", peer.peer_id, peer.username, meta)  # usage
-            logger.info(f"Producer registered: {peer.peer_id} with meta: {meta}")
+            # Daemons re-send this every heartbeat (10 s): only a new
+            # registration or a meta change is worth an INFO line.
+            logger.log(
+                logging.INFO if not was_producer or prev_meta != meta else logging.DEBUG,
+                "Producer registered: %s with meta: %s",
+                peer.peer_id,
+                repr(meta)[:300],
+            )
             return {
                 "type": "peerStatusChanged",
                 "peerId": peer.peer_id,
@@ -843,6 +1276,36 @@ class SignalingServer:
             logger.warning(f"User {peer.username} tried to access producer owned by {producer.username}")
             return {"type": "error", "details": "Access denied: you don't own this robot"}
 
+        # A consumer re-starting a session on the robot it already holds
+        # (it reconnected within the SSE grace and redials, or its
+        # fire-and-forget endSession lost the race against the new
+        # startSession) replaces its own old session instead of being
+        # rejected as robot_busy by it. Active whatever the grace
+        # setting. The producer gets the endSession; the consumer does
+        # not, and any endSession for the old session still queued for it
+        # is dropped (it abandoned that session, and an endSession
+        # arriving mid-setup would abort the new one). Any OTHER consumer
+        # still gets robot_busy below.
+        if (
+            producer.session_id is not None
+            and producer.partner_id == peer.peer_id
+            and peer.session_id == producer.session_id
+        ):
+            old_session_id = producer.session_id
+            logger.info(
+                "Session %s replaced by a new startSession from its consumer %s",
+                old_session_id,
+                peer.peer_id,
+            )
+            self.remember_self_ended_session(peer, old_session_id)
+            self.sse_stats["consumer_session_replaced_total"] += 1
+            await self.handle_end_session(
+                old_session_id,
+                reason="session_replaced",
+                end_cause=SESSION_END_CONSUMER_REPLACED,
+                skip_notify=peer.peer_id,
+            )
+
         # Concurrency gate: reject if producer already has an active session.
         # The existing consumer's app name is read from its meta (set via setPeerStatus).
         if producer.session_id is not None:
@@ -925,6 +1388,7 @@ class SignalingServer:
         reason: Optional[str] = None,
         *,
         end_cause: str = SESSION_END_OTHER,
+        skip_notify: Optional[str] = None,
     ):
         """End a session and notify both peers.
 
@@ -938,6 +1402,11 @@ class SignalingServer:
         ``end_cause`` is the server-side category (``SESSION_END_*``) of
         the code path ending the session, recorded by fleet usage. It is
         independent of ``reason``, which is client-controlled.
+
+        ``skip_notify`` names a peer whose session state is cleared but
+        who is NOT sent the ``endSession``: a detaching peer (see
+        ``detach_peer``) or a consumer replacing its own session (see
+        ``handle_start_session``) already knows.
         """
         if session_id not in self.sessions:
             return
@@ -958,7 +1427,8 @@ class SignalingServer:
                 peer = self.peers[peer_id]
                 peer.session_id = None
                 peer.partner_id = None
-                await self.send_to_peer(peer_id, msg)
+                if peer_id != skip_notify:
+                    await self.send_to_peer(peer_id, msg)
 
         del self.sessions[session_id]
         self._track("session_ended", session_id, end_cause)  # usage
@@ -1021,6 +1491,11 @@ class SignalingServer:
             return None
 
         elif msg_type == "endSession":
+            # The sender ended this session itself: drop any stale
+            # endSession for it already queued for the sender (e.g.
+            # queued while it was detached), and never replay one for it
+            # after a reconnect (see ``attach_sse``).
+            self.remember_self_ended_session(peer, message.get("sessionId"))
             await self.handle_end_session(
                 message.get("sessionId"),
                 reason=message.get("reason"),
@@ -1058,6 +1533,11 @@ class SignalingServer:
         and force-reconnects - the exact recovery path daemons already
         exercise on every central redeploy.
 
+        Detached producers (SSE closed, reconnect grace running) are
+        skipped: the grace expiry (``expire_detached_peers``, run just
+        before this sweep) owns their eviction, so no peer is processed
+        by both paths. A reattach refreshes ``last_seen``.
+
         Returns the list of evicted peer ids (handy for tests/logs).
         """
         now = time.monotonic()
@@ -1065,10 +1545,11 @@ class SignalingServer:
             pid
             for pid, p in self.producers.items()
             if p.meta.get("hardware_id")
+            and not (p.detached_at is not None and self.peers.get(pid) is p)
             and now - p.last_seen > PRODUCER_LEASE_SECONDS
         ]
         for pid in stale:
-            peer = self.peers.get(pid)
+            peer = self.peers.get(pid) or self.producers.get(pid)
             logger.warning(
                 "Sweeping stale producer %s (name=%r, silent for %.0fs)",
                 pid,
@@ -1079,30 +1560,52 @@ class SignalingServer:
         return stale
 
     async def run_producer_sweeper(self) -> None:
-        """Background task: periodic stale-producer sweep + cache pruning.
+        """Background task: periodic grace expiry, stale-producer sweep, pruning.
+
+        Order per tick: expire detached peers whose SSE reconnect grace
+        ran out, then sweep stale (silent) producers, which skips detached
+        peers. Also emits the once-per-minute auth and SSE summary lines.
 
         Also rolls the fleet usage window over, so windows close on time
         even when no signalling event arrives.
         """
         while True:
             await asyncio.sleep(PRODUCER_SWEEP_INTERVAL_SECONDS)
+            await self.run_sweeper_tick()
+
+    async def run_sweeper_tick(self) -> None:
+        """One sweeper iteration. Each step runs in its own try/except so a
+        failure in one (logged with its traceback) never skips the others."""
+        for name, step in (
+            ("grace expiry", self.expire_detached_peers),
+            ("stale-producer sweep", self.sweep_stale_producers),
+        ):
             try:
-                await self.sweep_stale_producers()
-                _prune_rate_limit_buckets()
-                _prune_token_cache()
+                await step()
             except Exception:
-                logger.exception("Producer sweeper iteration failed")
-            self._track("maybe_roll")  # usage
+                logger.exception("Sweeper step failed: %s", name)
+        for name, fn in (
+            ("rate-limit prune", _prune_rate_limit_buckets),
+            ("token cache prune", lambda: hf_validator.prune()),
+            ("auth summary", lambda: hf_validator.maybe_log_summary()),
+            ("SSE summary", self.maybe_log_sse_summary),
+        ):
+            try:
+                fn()
+            except Exception:
+                logger.exception("Sweeper step failed: %s", name)
+        self._track("maybe_roll")  # usage
 
     async def disconnect_peer(
         self, peer_id: str, *, end_cause: str = SESSION_END_OTHER
     ):
         """Fully evict a peer from every server-side structure.
 
-        Called from three places:
+        Called from:
 
-        - SSE close path (``request.is_disconnected()`` becoming true:
-          the peer's HTTP channel closed cleanly).
+        - SSE close path, via ``detach_peer``: immediately when the
+          reconnect grace is disabled, otherwise from
+          ``expire_detached_peers`` once the grace ran out.
         - ``_evict_stable_id_collisions``, when a duplicate registers.
         - ``sweep_stale_producers``, when a heartbeat-capable producer
           went silent for a full lease (half-open socket).
@@ -1122,10 +1625,16 @@ class SignalingServer:
         usage: each caller passes the one matching its path.
         """
         if peer_id not in self.peers:
+            # Defensive: a producers entry must never outlive its peer
+            # (e.g. re-inserted by a request that raced an eviction).
+            if self.producers.pop(peer_id, None) is not None:
+                self._track("producer_gone", peer_id)  # usage
             return
 
         peer = self.peers[peer_id]
         peer.connected = False
+        peer.grace_deadline = None
+        peer.detached_at = None
 
         # End any session this peer is part of (either as producer or consumer).
         # handle_end_session clears session_id/partner_id on both sides and
@@ -1216,41 +1725,43 @@ async def events(request: Request, token: str = Depends(_resolve_hf_token)):
 
     # One queue and one generation per SSE connection. A reconnect on
     # the same token (daemon restart while its previous socket is
-    # half-open behind the proxy) supersedes the old generator: it
-    # must neither steal messages from the shared queue nor evict the
-    # peer when its dead socket finally closes. Replacing the queue is
-    # safe because an SSE (re)connect restarts the conversation anyway
-    # (welcome + list are re-sent below); anything queued before the
-    # reconnect addressed the previous connection.
-    peer.sse_generation += 1
-    generation = peer.sse_generation
-    peer.message_queue = asyncio.Queue()
-    queue = peer.message_queue
+    # half-open behind the proxy, or a reattach within the SSE grace)
+    # supersedes the old generator: it must neither steal messages from
+    # the new queue nor detach / evict the peer when its dead socket
+    # finally closes. Messages still queued for the peer (e.g. queued
+    # while it was detached) are carried over to the new queue and
+    # delivered after the welcome + list below (see ``attach_sse``).
+    generation, queue = await signaling.connect_sse(peer)
 
     def _is_current_connection() -> bool:
         return signaling.peers.get(peer.peer_id) is peer and peer.sse_generation == generation
 
     async def event_generator() -> AsyncGenerator[dict, None]:
-        # Send welcome message with username for client info. The
-        # advertised heartbeat cadence drives daemons >= v1.7.2 (they
-        # negotiate from this field); older daemons ignore it and keep
-        # their internal default, which is faster and therefore safe.
-        yield {
-            "event": "message",
-            "data": json.dumps(
-                {
-                    "type": "welcome",
-                    "peerId": peer.peer_id,
-                    "username": username,
-                    "recommended_heartbeat_interval_seconds": RECOMMENDED_HEARTBEAT_INTERVAL_SECONDS,
-                }
-            ),
-        }
-
-        # Send current producers list for listeners (filtered by owner)
-        yield {"event": "message", "data": json.dumps({"type": "list", "producers": signaling.get_producers_list(username)})}
-
+        # The try covers the welcome + list too, so a stream that dies
+        # during the handshake still detaches its peer.
         try:
+            if _is_current_connection():
+                signaling.sse_stream_started(peer)
+
+            # Send welcome message with username for client info. The
+            # advertised heartbeat cadence drives daemons >= v1.7.2 (they
+            # negotiate from this field); older daemons ignore it and keep
+            # their internal default, which is faster and therefore safe.
+            yield {
+                "event": "message",
+                "data": json.dumps(
+                    {
+                        "type": "welcome",
+                        "peerId": peer.peer_id,
+                        "username": username,
+                        "recommended_heartbeat_interval_seconds": RECOMMENDED_HEARTBEAT_INTERVAL_SECONDS,
+                    }
+                ),
+            }
+
+            # Send current producers list for listeners (filtered by owner)
+            yield {"event": "message", "data": json.dumps({"type": "list", "producers": signaling.get_producers_list(username)})}
+
             while True:
                 # Check if client disconnected. Best-effort:
                 # ``is_disconnected`` returns True on FIN/RST visible
@@ -1276,13 +1787,12 @@ async def events(request: Request, token: str = Depends(_resolve_hf_token)):
                     yield {"event": "ping", "data": ""}
 
         finally:
-            # Only the peer's current connection may evict it: a stale
+            # Only the peer's current connection may detach it: a stale
             # generator closing late must not tear down the live peer
-            # that superseded it.
+            # that superseded it. Detaching starts the reconnect grace
+            # (or evicts at once when the grace is disabled).
             if _is_current_connection():
-                await signaling.disconnect_peer(
-                    peer.peer_id, end_cause=SESSION_END_PEER_DISCONNECTED
-                )
+                await signaling.detach_peer(peer.peer_id)
 
     return EventSourceResponse(event_generator())
 
@@ -1308,6 +1818,11 @@ async def send_message(request: Request, token: str = Depends(_resolve_hf_token)
     peer = signaling.peers[peer_id]
 
     body = await request.json()
+    # The peer may have been evicted (grace expiry, sweep, collision)
+    # while the body was being read: handling the message anyway could
+    # re-insert a ghost into ``producers``.
+    if signaling.peers.get(peer_id) is not peer:
+        raise HTTPException(status_code=400, detail="Peer not found")
     response = await signaling.handle_message(peer, body)
 
     return response or {"status": "ok"}
@@ -1621,6 +2136,8 @@ def _cached_health_body(now: Optional[float] = None) -> dict:
         "status": "healthy",
         **_public_counters(),
         "usage_publisher": publisher_health(usage, usage_publisher),
+        "auth": hf_validator.health(),
+        "sse": signaling.sse_health(),
     }
     _health_cache = (now, body)
     return body
@@ -1673,6 +2190,18 @@ async def health():
                 "last_published_at": "2026-09-16T08:30:00Z",
                 "pending_rows": 0,
                 "dropped_rows": 0
+            },
+            "auth": {
+                "cache_size": 280, "negative_cache_size": 3,
+                "whoami_calls_total": 1200, "whoami_rejected_total": 4,
+                "whoami_errors_total": 0, "unknown_token_shed_total": 0
+            },
+            "sse": {
+                "grace_seconds": 15.0, "detached_now": 0,
+                "detach_total": 120, "reattach_total": 118,
+                "grace_expired_total": 2, "reattach_latency_s_max": 8.8,
+                "sessions_ended_at_detach_total": 7,
+                "consumer_session_replaced_total": 1
             }
         }
 
@@ -1680,6 +2209,19 @@ async def health():
     (``enabled`` false when no sink is configured; ``last_published_at``
     null until the first successful publish) - the only outside view of a
     stalled publisher.
+
+    ``auth`` is the token-validation layer's aggregate state: positive /
+    negative cache sizes and since-boot counters of whoami calls, explicit
+    HF rejections, inconclusive calls (network / 429 / 5xx) and
+    unknown-token requests shed by the whoami cap (503). No identifiers.
+
+    ``sse`` is the SSE reconnect grace's aggregate state: the configured
+    grace, peers currently detached (SSE closed, still registered and
+    counted above), and since-boot counts of detaches, reattaches within
+    the grace, grace expiries (evictions) and the longest reattach
+    latency seen, plus producer sessions ended because the producer's
+    stream closed or was superseded and consumer self-replacements. No
+    identifiers.
 
     The body is served from a micro-cache (``HEALTH_CACHE_SECONDS``), so
     values may lag live state by up to that long.
@@ -1758,7 +2300,11 @@ async def debug_peers(token: str = Depends(_resolve_hf_token)):
     not just registered producers. Use this when a robot does not show up
     where expected: see whether the daemon's SSE channel is still open
     (``connected=True``), how stale ``last_seen`` is, what role/meta is
-    registered, and whether a session is in progress.
+    registered, and whether a session is in progress. ``detached`` is
+    true while the peer's SSE stream is closed but its reconnect grace is
+    still running (it is then still listed and counted);
+    ``detached_age_seconds`` is how long it has been detached (null when
+    attached).
 
     This is more verbose than ``/api/robot-status`` (which only returns
     registered producers and elides session/peer details). Same auth
@@ -1777,7 +2323,9 @@ async def debug_peers(token: str = Depends(_resolve_hf_token)):
                     "partner_id": null,
                     "meta": {...},
                     "last_seen": 1230.12,
-                    "last_seen_age_seconds": 4.44
+                    "last_seen_age_seconds": 4.44,
+                    "detached": false,
+                    "detached_age_seconds": null
                 },
                 ...
             ]
@@ -1790,6 +2338,7 @@ async def debug_peers(token: str = Depends(_resolve_hf_token)):
         )
 
     now = time.monotonic()
+    grace_now = signaling.clock()
     peers = []
     for pid, p in signaling.peers.items():
         if p.username != username:
@@ -1805,6 +2354,12 @@ async def debug_peers(token: str = Depends(_resolve_hf_token)):
                 "meta": p.meta,
                 "last_seen": round(p.last_seen, 2),
                 "last_seen_age_seconds": round(now - p.last_seen, 2),
+                "detached": p.detached_at is not None,
+                "detached_age_seconds": (
+                    round(max(0.0, grace_now - p.detached_at), 2)
+                    if p.detached_at is not None
+                    else None
+                ),
             }
         )
 

@@ -66,7 +66,7 @@ def _reset_signaling_state() -> None:
 
 
 @pytest.fixture
-def client():
+def client(monkeypatch):
     """Fresh module-global state + a TestClient without lifespan."""
     cache_snapshot = dict(token_cache)
     bucket_snapshot = {k: v.copy() for k, v in _rate_limit_buckets.items()}
@@ -74,6 +74,12 @@ def client():
     app_module._health_cache_reset()
     token_cache.clear()
     _rate_limit_buckets.clear()
+    # Fresh validator (counters, negative cache, bucket) sharing token_cache.
+    monkeypatch.setattr(
+        app_module,
+        "hf_validator",
+        app_module.hf_auth.TokenValidator(token_cache=token_cache),
+    )
     fresh = time.monotonic() + TOKEN_CACHE_TTL_SECONDS
     token_cache[ALICE_TOKEN] = (ALICE, fresh)
     token_cache[BOB_TOKEN] = (BOB, fresh)
@@ -195,6 +201,7 @@ def test_health_shape(client):
     assert set(data) == {
         "status", "peers", "producers", "sessions",
         "producers_by_kind", "started_at", "uptime_seconds", "usage_publisher",
+        "auth", "sse",
     }
     assert data["status"] == "healthy"
     assert data["peers"] == data["producers"] == data["sessions"] == 0
@@ -384,7 +391,6 @@ def test_robot_status_rejects_unknown_token_without_network(client, monkeypatch)
     """A token that is not cached goes to whoami; stub it to a 401 so the
     ``Invalid token`` branch is covered deterministically.
     """
-    import httpx
 
     class _Resp:
         status_code = 401
@@ -393,16 +399,16 @@ def test_robot_status_rejects_unknown_token_without_network(client, monkeypatch)
             return {}
 
     class _FakeClient:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *exc):
-            return False
+        def __init__(self, **kwargs):
+            pass
 
         async def get(self, *a, **kw):
             return _Resp()
 
-    monkeypatch.setattr(httpx, "AsyncClient", _FakeClient)
+        async def aclose(self):
+            pass
+
+    monkeypatch.setattr(app_module.hf_validator, "client_factory", _FakeClient)
     r = client.get("/api/robot-status", headers=_bearer("never-seen"))
     assert r.status_code == 401
     assert r.json() == {"detail": "Invalid token"}
@@ -470,7 +476,10 @@ def test_debug_peers_filters_by_owner_and_includes_consumers(client):
     assert set(producer_rows[0]) == {
         "peerId", "role", "connected", "in_producers", "session_id",
         "partner_id", "meta", "last_seen", "last_seen_age_seconds",
+        "detached", "detached_age_seconds",
     }
+    assert producer_rows[0]["detached"] is False
+    assert producer_rows[0]["detached_age_seconds"] is None
 
 
 # ----------------------------------------------------------------------

@@ -64,13 +64,56 @@ label in `ROBOT_KIND_LABELS`) in `robot_kinds.py`; the tests in
   "producers_by_kind": {"reachy_mini": 1, "microduck": 1, "other": 0},
   "started_at": "2026-09-16T08:00:00Z",
   "uptime_seconds": 12345,
-  "usage_publisher": {"enabled": true, "last_published_at": "2026-09-16T08:30:00Z", "pending_rows": 0, "dropped_rows": 0}
+  "usage_publisher": {"enabled": true, "last_published_at": "2026-09-16T08:30:00Z", "pending_rows": 0, "dropped_rows": 0},
+  "auth": {
+    "cache_size": 280,
+    "negative_cache_size": 3,
+    "whoami_calls_total": 1200,
+    "whoami_rejected_total": 4,
+    "whoami_errors_total": 0,
+    "unknown_token_shed_total": 0
+  },
+  "sse": {
+    "grace_seconds": 15.0,
+    "detached_now": 0,
+    "detach_total": 120,
+    "reattach_total": 118,
+    "grace_expired_total": 2,
+    "reattach_latency_s_max": 8.8,
+    "sessions_ended_at_detach_total": 7,
+    "consumer_session_replaced_total": 1
+  }
 }
 ```
 
 `peers`, `producers` and `producers_by_kind` count **connected** peers
-only. `started_at` / `uptime_seconds` are wall-clock and exist so an
+only. A peer whose SSE stream closed less than the reconnect grace ago
+(`sse.grace_seconds`, see the README's "Liveness and SSE reconnect
+grace") is still connected for these counters: it is logically online
+and keeps its peerId if it comes back. `started_at` / `uptime_seconds` are wall-clock and exist so an
 operator can tell a fresh redeploy (all counters reset) from a quiet
 fleet. Both `/` and `/health` are served with `Cache-Control: no-store`.
 `usage_publisher` is the fleet usage publisher's aggregate state (see
 [`FLEET_USAGE.md`](FLEET_USAGE.md)).
+
+`auth` is the token-validation layer's aggregate state (no tokens,
+hashes or usernames): `cache_size` / `negative_cache_size` are the
+current number of validated tokens (fresh or stale) and of tokens HF
+recently rejected; the `_total` fields count since boot the whoami calls
+made, the explicit HF 401/403 among them, the inconclusive ones
+(network error, timeout, HF 429/5xx), and the requests carrying a
+never-seen token that were answered `503` because the whoami budget for
+unknown tokens was exhausted (a never-seen token HF gave no verdict for
+is also answered `503`, and counted in `whoami_errors_total`). See the
+README's "Token validation and caching" section.
+
+`sse` is the SSE reconnect grace's aggregate state (no peer ids, tokens
+or usernames): the configured `grace_seconds` (`0` = disabled), the
+number of peers currently detached (SSE closed, grace running, still
+counted above), and since-boot counts of detaches, reattaches within the
+grace and grace expiries (evictions, including peers whose newest SSE
+connection never started streaming), plus the longest reattach latency
+seen in seconds. `sessions_ended_at_detach_total` counts producer
+sessions ended because the producer's SSE stream closed or was
+superseded; `consumer_session_replaced_total` counts sessions a consumer
+replaced by starting a new one on the robot it already held.

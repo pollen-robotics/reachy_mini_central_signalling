@@ -575,9 +575,13 @@ class _ClosedRequest:
 
 
 async def test_end_reason_sse_drop_through_events_route(monkeypatch):
-    """The real ``/events`` generator: its close path categorises as peer_disconnected."""
+    """The real ``/events`` generator: its close path categorises as peer_disconnected.
+
+    Grace disabled: the close evicts at once (the SSE grace variant is
+    ``test_sse_grace.py::test_route_sse_close_then_expiry_records_peer_disconnected``).
+    """
     tracker, clock = _tracker()
-    server = SignalingServer(usage=tracker)
+    server = SignalingServer(usage=tracker, sse_grace_seconds=0)
     monkeypatch.setattr(app_module, "signaling", server)
     monkeypatch.setitem(token_cache, "tok-sse-producer", ("alice", float("inf")))
     producer = server.get_or_create_peer("tok-sse-producer", "alice")

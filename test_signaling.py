@@ -24,11 +24,13 @@ Run with::
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections import deque
 
 import pytest
 
+import app as app_module
 from app import (
     PRODUCER_LEASE_SECONDS,
     RATE_LIMIT_REQUESTS,
@@ -852,6 +854,11 @@ async def test_hardware_id_collision_scoped_to_owner():
 
 # ----------------------------------------------------------------------
 # Token cache: TTL, serve-stale-on-error, explicit-rejection drop
+#
+# Expired entries are served stale while ONE background whoami call
+# re-validates them, so the outcome of a refresh is asserted after
+# ``_drain_whoami()``. Deeper coverage (single-flight, negative cache,
+# unknown-token cap, logging) lives in test_auth_cache.py.
 # ----------------------------------------------------------------------
 
 
@@ -876,17 +883,14 @@ class _FakeResponse:
 
 
 class _FakeAsyncClient:
-    """Stands in for httpx.AsyncClient; behaviour set per test."""
+    """Stands in for the shared whoami client; behaviour set per test."""
 
     response: _FakeResponse | None = None
     error: Exception | None = None
     calls: int = 0
 
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *exc):
-        return False
+    def __init__(self, **kwargs):
+        self.is_closed = False
 
     async def get(self, *args, **kwargs):
         type(self).calls += 1
@@ -894,22 +898,34 @@ class _FakeAsyncClient:
             raise type(self).error
         return type(self).response
 
+    async def aclose(self):
+        self.is_closed = True
+
 
 @pytest.fixture
 def _fake_whoami(monkeypatch):
-    import httpx
-
     _FakeAsyncClient.response = None
     _FakeAsyncClient.error = None
     _FakeAsyncClient.calls = 0
-    monkeypatch.setattr(httpx, "AsyncClient", _FakeAsyncClient)
+    validator = app_module.hf_auth.TokenValidator(
+        client_factory=_FakeAsyncClient, token_cache=token_cache
+    )
+    monkeypatch.setattr(app_module, "hf_validator", validator)
     return _FakeAsyncClient
+
+
+async def _drain_whoami() -> None:
+    """Wait until no whoami call (foreground or background) is in flight."""
+    inflight = app_module.hf_validator._inflight
+    while inflight:
+        await asyncio.gather(*list(inflight.values()), return_exceptions=True)
 
 
 @pytest.mark.asyncio
 async def test_fresh_cache_hit_skips_network(_clean_token_cache, _fake_whoami):
     token_cache["tok"] = ("alice", time.monotonic() + TOKEN_CACHE_TTL_SECONDS)
     assert await validate_hf_token("tok") == "alice"
+    await _drain_whoami()
     assert _fake_whoami.calls == 0
 
 
@@ -921,6 +937,7 @@ async def test_expired_entry_revalidates_and_refreshes_ttl(
     _fake_whoami.response = _FakeResponse(200, "alice")
 
     assert await validate_hf_token("tok") == "alice"
+    await _drain_whoami()
     assert _fake_whoami.calls == 1
     assert token_cache["tok"][1] > time.monotonic(), "TTL must be refreshed"
 
@@ -935,8 +952,13 @@ async def test_revoked_token_is_dropped_on_explicit_rejection(
     token_cache["tok"] = ("alice", time.monotonic() - 1.0)
     _fake_whoami.response = _FakeResponse(401)
 
-    assert await validate_hf_token("tok") is None
+    # Served stale while the background refresh runs...
+    assert await validate_hf_token("tok") == "alice"
+    await _drain_whoami()
+    # ...which drops the entry on the explicit rejection.
     assert "tok" not in token_cache
+    assert await validate_hf_token("tok") is None
+    assert _fake_whoami.calls == 1
 
 
 @pytest.mark.asyncio
@@ -951,7 +973,10 @@ async def test_whoami_429_is_not_treated_as_revocation(
     _fake_whoami.response = _FakeResponse(429)
 
     assert await validate_hf_token("tok") == "alice"
+    await _drain_whoami()
+    assert _fake_whoami.calls == 1
     assert "tok" in token_cache, "entry must survive an HF 429"
+    assert await validate_hf_token("tok") == "alice"
 
 
 @pytest.mark.asyncio
@@ -962,7 +987,10 @@ async def test_whoami_5xx_is_not_treated_as_revocation(
     _fake_whoami.response = _FakeResponse(503)
 
     assert await validate_hf_token("tok") == "alice"
+    await _drain_whoami()
+    assert _fake_whoami.calls == 1
     assert "tok" in token_cache
+    assert await validate_hf_token("tok") == "alice"
 
 
 @pytest.mark.asyncio
@@ -976,15 +1004,25 @@ async def test_stale_entry_served_during_validation_outage(
     _fake_whoami.error = ConnectionError("whoami down")
 
     assert await validate_hf_token("tok") == "alice"
+    await _drain_whoami()
+    assert _fake_whoami.calls == 1
     assert "tok" in token_cache, "stale entry must survive for the next retry"
+    assert await validate_hf_token("tok") == "alice"
 
 
 @pytest.mark.asyncio
 async def test_unknown_token_fails_closed_during_outage(
     _clean_token_cache, _fake_whoami
 ):
+    """No identity is granted without a verdict - but no verdict is not a
+    rejection either: 503 (retry), never a 401 that reads as "bad token".
+    """
     _fake_whoami.error = ConnectionError("whoami down")
-    assert await validate_hf_token("never-seen") is None
+    with pytest.raises(app_module.TokenValidationUnavailable) as exc:
+        await validate_hf_token("never-seen")
+    assert exc.value.status_code == 503
+    assert "never-seen" not in token_cache
+    assert _fake_whoami.calls == 1
 
 
 def test_prune_token_cache_drops_only_beyond_grace(_clean_token_cache):

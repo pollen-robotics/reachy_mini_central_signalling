@@ -2,5 +2,5 @@ fastapi==0.115.0
 uvicorn[standard]==0.30.0
 python-multipart==0.0.9
 httpx>=0.25.0
-sse-starlette>=1.6.0
+sse-starlette==3.0.3
 huggingface_hub==2.0.0

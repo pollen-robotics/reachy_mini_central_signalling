@@ -120,9 +120,10 @@ disconnects.
   | --- | --- |
   | `ended` | explicit `endSession` from a peer (app or daemon) |
   | `withdrawn` | the producer sent `setPeerStatus(roles=[])` |
-  | `peer_disconnected` | the producer's or the consumer's SSE channel closed |
+  | `peer_disconnected` | an SSE channel closed: the producer's (the session ends as soon as its stream closes) or the consumer's (the session ends when the consumer's reconnect grace expires without it coming back) - see the README's "Liveness and SSE reconnect grace" |
   | `swept` | stale-producer sweep evicted the silent producer |
   | `replaced` | a newer registration with the same `hardware_id`/`install_id` evicted the producer |
+  | `consumer_replaced` | the consumer started a new session on the robot it already held a session with (typically after reconnecting within the SSE grace); its old session is replaced instead of rejecting the new one as `robot_busy` |
   | `other` | anything else |
 
   Server restarts close every SSE channel, so sessions open at shutdown
@@ -214,7 +215,7 @@ is shaped for the page and may change with it.
     "microduck": {"count": 2, "sum_s": 95.2, "max_s": 80.1, "hist": [0, 1, 1, 0, 0, 0]},
     "other": {"count": 0, "sum_s": 0.0, "max_s": 0.0, "hist": [0, 0, 0, 0, 0, 0]}
   },
-  "session_end_reasons": {"ended": 25, "withdrawn": 2, "peer_disconnected": 4, "swept": 0, "replaced": 0, "other": 0}
+  "session_end_reasons": {"ended": 25, "withdrawn": 2, "peer_disconnected": 4, "swept": 0, "replaced": 0, "consumer_replaced": 0, "other": 0}
 }
 ```
 

@@ -59,6 +59,8 @@ SESSION_END_WITHDRAWN = "withdrawn"  # producer sent setPeerStatus(roles=[])
 SESSION_END_PEER_DISCONNECTED = "peer_disconnected"  # an SSE channel closed
 SESSION_END_SWEPT = "swept"  # stale-producer sweep eviction
 SESSION_END_REPLACED = "replaced"  # stable-id collision evicted the producer
+# the consumer started a new session on the robot it already held
+SESSION_END_CONSUMER_REPLACED = "consumer_replaced"
 SESSION_END_OTHER = "other"
 SESSION_END_REASONS = (
     SESSION_END_ENDED,
@@ -66,6 +68,7 @@ SESSION_END_REASONS = (
     SESSION_END_PEER_DISCONNECTED,
     SESSION_END_SWEPT,
     SESSION_END_REPLACED,
+    SESSION_END_CONSUMER_REPLACED,
     SESSION_END_OTHER,
 )
 # ``meta.hardware_id`` is client-controlled. A value longer than this (or
