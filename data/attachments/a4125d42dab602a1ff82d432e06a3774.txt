@@ -1,0 +1,17 @@
+ERROR    app:app.py:1586 Sweeper step failed: grace expiry
+Traceback (most recent call last):
+  File "/home/runner/work/reachy_mini_central_signalling/reachy_mini_central_signalling/app.py", line 1584, in run_sweeper_tick
+    await step()
+  File "/home/runner/work/reachy_mini_central_signalling/reachy_mini_central_signalling/test_sse_grace.py", line 1214, in boom
+    raise RuntimeError("expiry bug")
+RuntimeError: expiry bug
+ERROR    app:app.py:1596 Sweeper step failed: rate-limit prune
+Traceback (most recent call last):
+  File "/home/runner/work/reachy_mini_central_signalling/reachy_mini_central_signalling/app.py", line 1594, in run_sweeper_tick
+    fn()
+  File "/home/runner/work/reachy_mini_central_signalling/reachy_mini_central_signalling/test_sse_grace.py", line 1223, in <lambda>
+    monkeypatch.setattr(app_module, "_prune_rate_limit_buckets", lambda: (_ for _ in ()).throw(RuntimeError("prune bug")))
+                                                                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/runner/work/reachy_mini_central_signalling/reachy_mini_central_signalling/test_sse_grace.py", line 1223, in <genexpr>
+    monkeypatch.setattr(app_module, "_prune_rate_limit_buckets", lambda: (_ for _ in ()).throw(RuntimeError("prune bug")))
+RuntimeError: prune bug

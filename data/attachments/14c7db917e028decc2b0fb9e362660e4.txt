@@ -1,0 +1,2 @@
+WARNING  hf_auth:hf_auth.py:494 Token rejected by HF: 401 (token_hash=4bb47f186df2)
+INFO     hf_auth:hf_auth.py:330 Auth summary (last 60s): whoami_calls=1 rejected=1 errors=0 negative_cache_hits=99 unknown_token_shed=0 cache_size=0 negative_cache_size=1

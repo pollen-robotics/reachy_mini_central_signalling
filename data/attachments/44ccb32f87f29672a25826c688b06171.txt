@@ -1,0 +1,5 @@
+INFO     fleet_usage:fleet_usage.py:1262 Fleet usage publishing to dataset pollen-robotics/fleet_usage_test every 1800s
+INFO     fleet_usage:test_usage.py:972 config=FleetUsageConfig(dataset='pollen-robotics/fleet_usage_test', local_dir=None, publish_seconds=1800.0, window_seconds=600) sink=HfDatasetUsageSink(repo_id='pollen-robotics/fleet_usage_test')
+WARNING  fleet_usage:fleet_usage.py:1055 Fleet usage publish to dataset pollen-robotics/fleet_usage_test failed (PermissionError: 401 for token ***); 1 row(s) kept for retry
+INFO     fleet_usage:fleet_usage.py:983 Fleet usage bootstrapped from dataset pollen-robotics/fleet_usage_test: 0 window row(s), 0 daily row(s)
+INFO     fleet_usage:fleet_usage.py:1064 Fleet usage published to dataset pollen-robotics/fleet_usage_test: data/windows/2026-09-30.jsonl, summary.json

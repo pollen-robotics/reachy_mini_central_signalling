@@ -1,0 +1,4 @@
+WARNING  hf_auth:hf_auth.py:494 Token rejected by HF: 401 (token_hash=acc4be32a47e)
+WARNING  hf_auth:hf_auth.py:494 Token rejected by HF: 401 (token_hash=6275bc48d2a2, cached identity dropped)
+WARNING  hf_auth:hf_auth.py:425 Token validation inconclusive (ConnectionError: down); known tokens keep their cached identity, unknown ones get 503, further failures are counted in the auth summary
+INFO     hf_auth:hf_auth.py:330 Auth summary (last 3600s): whoami_calls=3 rejected=2 errors=1 negative_cache_hits=3 unknown_token_shed=0 cache_size=0 negative_cache_size=2

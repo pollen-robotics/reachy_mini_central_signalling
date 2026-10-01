@@ -1,0 +1,1 @@
+{"id":"589917e604c3d16d0ad0463e3b7ca801.d41d8cd98f00b204e9800998ecf8427e","fullName":"test_auth_cache#test_lifespan_closes_client_and_shutdown_is_bounded","name":"test_lifespan_closes_client_and_shutdown_is_bounded","status":"passed","testResultsByEnv":{"default":"d540ffb7d24ef84c3eaa9c818b88b3c4"}}

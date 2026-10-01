@@ -1,0 +1,1 @@
+INFO     hf_auth:hf_auth.py:330 Auth summary (last 60s): whoami_calls=0 rejected=0 errors=0 negative_cache_hits=0 unknown_token_shed=50 cache_size=0 negative_cache_size=0

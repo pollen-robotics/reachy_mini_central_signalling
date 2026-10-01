@@ -1,2 +1,0 @@
-WARNING  fleet_usage:fleet_usage.py:345 Fleet usage: 980 robot sighting(s) over the distinct-key caps (20 per owner, 20000 per kind) ignored in window 2026-09-30T00:00:00Z
-WARNING  fleet_usage:fleet_usage.py:345 Fleet usage: 481 robot sighting(s) over the distinct-key caps (20 per owner, 20000 per kind) ignored in window 2026-09-30T00:10:00Z

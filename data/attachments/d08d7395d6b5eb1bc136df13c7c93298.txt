@@ -1,0 +1,1 @@
+INFO     app:app.py:992 SSE summary (last 82s): detached=2 reattached=1 grace_expired=1 detached_now=0 reattach_latency_max=7.0s

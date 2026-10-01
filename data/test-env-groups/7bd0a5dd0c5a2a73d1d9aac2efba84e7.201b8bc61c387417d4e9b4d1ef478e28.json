@@ -1,0 +1,1 @@
+{"id":"7bd0a5dd0c5a2a73d1d9aac2efba84e7.201b8bc61c387417d4e9b4d1ef478e28","fullName":"test_auth_cache#test_negatively_cached_token_is_401_without_hf_call","name":"test_negatively_cached_token_is_401_without_hf_call[GET-/api/robot-status]","status":"passed","testResultsByEnv":{"default":"7f6b7886f906a2700f40ee4c93d18776"}}

@@ -1,0 +1,1 @@
+WARNING  hf_auth:hf_auth.py:425 Token validation inconclusive (PoolTimeout: pool full); known tokens keep their cached identity, unknown ones get 503, further failures are counted in the auth summary

@@ -1,0 +1,2 @@
+INFO     hf_auth:hf_auth.py:482 Token validated for user: alice
+DEBUG    hf_auth:hf_auth.py:480 Token re-validated for user: alice

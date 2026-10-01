@@ -1,0 +1,7 @@
+ERROR    app:app.py:952 SSE grace expiry failed for one peer; continuing
+Traceback (most recent call last):
+  File "/home/runner/work/reachy_mini_central_signalling/reachy_mini_central_signalling/app.py", line 950, in expire_detached_peers
+    await self.disconnect_peer(pid, end_cause=SESSION_END_PEER_DISCONNECTED)
+  File "/home/runner/work/reachy_mini_central_signalling/reachy_mini_central_signalling/test_sse_grace.py", line 1196, in flaky
+    raise RuntimeError("boom")
+RuntimeError: boom

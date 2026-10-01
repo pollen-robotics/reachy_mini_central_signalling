@@ -1,1 +1,0 @@
-ERROR    app:app.py:477 Error validating token: whoami down

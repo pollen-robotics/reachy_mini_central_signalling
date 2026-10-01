@@ -1,0 +1,12 @@
+DEBUG    app:app.py:1474 Received from f7eb783f-1a9a-40f7-b3d5-1459c8adfb9c: setPeerStatus
+INFO     app:app.py:1077 Producer registered: f7eb783f-1a9a-40f7-b3d5-1459c8adfb9c with meta: {'name': 'r1', 'hardware_id': 'hw1'}
+DEBUG    app:app.py:1474 Received from f7eb783f-1a9a-40f7-b3d5-1459c8adfb9c: setPeerStatus
+DEBUG    app:app.py:1077 Producer registered: f7eb783f-1a9a-40f7-b3d5-1459c8adfb9c with meta: {'name': 'r1', 'hardware_id': 'hw1'}
+DEBUG    app:app.py:1474 Received from f7eb783f-1a9a-40f7-b3d5-1459c8adfb9c: setPeerStatus
+INFO     app:app.py:1077 Producer registered: f7eb783f-1a9a-40f7-b3d5-1459c8adfb9c with meta: {'name': 'r1-renamed', 'hardware_id': 'hw1'}
+DEBUG    app:app.py:1474 Received from f7eb783f-1a9a-40f7-b3d5-1459c8adfb9c: setPeerStatus
+INFO     app:app.py:1120 Producer withdrew: f7eb783f-1a9a-40f7-b3d5-1459c8adfb9c (meta={'name': 'r1-renamed', 'hardware_id': 'hw1'})
+DEBUG    app:app.py:1474 Received from f7eb783f-1a9a-40f7-b3d5-1459c8adfb9c: setPeerStatus
+INFO     app:app.py:1077 Producer registered: f7eb783f-1a9a-40f7-b3d5-1459c8adfb9c with meta: {'name': 'r1-renamed', 'hardware_id': 'hw1'}
+DEBUG    app:app.py:1474 Received from f7eb783f-1a9a-40f7-b3d5-1459c8adfb9c: setPeerStatus
+INFO     app:app.py:1077 Producer registered: f7eb783f-1a9a-40f7-b3d5-1459c8adfb9c with meta: {'name': 'r1', 'hardware_id': 'hw1', 'blob': 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx

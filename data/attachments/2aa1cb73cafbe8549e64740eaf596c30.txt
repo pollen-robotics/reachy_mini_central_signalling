@@ -1,0 +1,4 @@
+WARNING  app:app.py:1057 Rejected setPeerStatus from 89ccf175-9a5f-4234-bc5c-259fb9e9433f: meta must be an object, got str
+WARNING  app:app.py:1057 Rejected setPeerStatus from 89ccf175-9a5f-4234-bc5c-259fb9e9433f: meta must be an object, got list
+WARNING  app:app.py:1057 Rejected setPeerStatus from 89ccf175-9a5f-4234-bc5c-259fb9e9433f: meta must be an object, got int
+WARNING  app:app.py:1057 Rejected setPeerStatus from 89ccf175-9a5f-4234-bc5c-259fb9e9433f: meta must be an object, got NoneType
