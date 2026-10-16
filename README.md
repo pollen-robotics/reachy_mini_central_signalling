@@ -86,8 +86,10 @@ window covers more time:
   (`access_log_filtered=` on the summary line); every non-2xx line and
   every other route is kept.
 - `Producer registered` is INFO only for a new registration or a meta
-  change (heartbeats re-send it every 10 s), with meta capped at 300
-  characters.
+  change (heartbeats re-send it every 10 s).
+- No line carries an HF username, a robot name, a `hardware_id` or any
+  other `meta` value: peers are identified by their `peerId`, and meta
+  is logged as its robot kind and key names only (`meta_for_log`).
 - A legacy `?token=` query value is printed as `token=***` in access
   lines.
 - SSE detaches, reattaches and grace expiries (see below) are summarised

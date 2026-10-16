@@ -213,6 +213,20 @@ logging.getLogger("httpx").addFilter(_DropWhoamiRequestLines())
 logger = logging.getLogger(__name__)
 
 
+def meta_for_log(meta: object) -> str:
+    """Describe ``meta`` for the logs without any client-sent value.
+
+    ``meta`` carries the robot name and ``hardware_id`` (also exposed on the
+    robot's LAN), and any key a client chooses, so only the robot kind and
+    the key names are logged. Same rule as fleet usage: no username, robot
+    name or ``hardware_id`` (pollen-robotics/reachy_mini_central_signalling#4).
+    """
+    if not isinstance(meta, dict):
+        return f"<{type(meta).__name__}>"
+    keys = ",".join(sorted(str(k)[:32] for k in meta)[:20])
+    return f"kind={robot_kind_of(meta)} keys=[{keys}]"
+
+
 # --- Liveness ---------------------------------------------------------
 #
 # Split ownership:
@@ -742,7 +756,7 @@ class SignalingServer:
         peer = Peer(peer_id=peer_id, username=username)
         self.peers[peer_id] = peer
         self.token_to_peer[token] = peer_id
-        logger.info(f"New peer created: {peer_id} for user {username}")
+        logger.info("New peer created: %s", peer_id)
         return peer
 
     # ------------------------------------------------------------------
@@ -1078,7 +1092,7 @@ class SignalingServer:
                 logging.INFO if not was_producer or prev_meta != meta else logging.DEBUG,
                 "Producer registered: %s with meta: %s",
                 peer.peer_id,
-                repr(meta)[:300],
+                meta_for_log(meta),
             )
             return {
                 "type": "peerStatusChanged",
@@ -1118,7 +1132,7 @@ class SignalingServer:
             del self.producers[peer.peer_id]
             self._track("producer_gone", peer.peer_id)  # usage
             logger.info(
-                "Producer withdrew: %s (meta=%s)", peer.peer_id, meta
+                "Producer withdrew: %s (meta: %s)", peer.peer_id, meta_for_log(meta)
             )
         peer.role = None
         if was_producer:
@@ -1273,7 +1287,11 @@ class SignalingServer:
 
         # Security: verify the user owns this producer
         if producer.username != peer.username:
-            logger.warning(f"User {peer.username} tried to access producer owned by {producer.username}")
+            logger.warning(
+                "Peer %s tried to access producer %s owned by another user",
+                peer.peer_id,
+                producer_id,
+            )
             return {"type": "error", "details": "Access denied: you don't own this robot"}
 
         # A consumer re-starting a session on the robot it already holds
@@ -1551,9 +1569,8 @@ class SignalingServer:
         for pid in stale:
             peer = self.peers.get(pid) or self.producers.get(pid)
             logger.warning(
-                "Sweeping stale producer %s (name=%r, silent for %.0fs)",
+                "Sweeping stale producer %s (silent for %.0fs)",
                 pid,
-                peer.meta.get("name") if peer else None,
                 now - peer.last_seen if peer else -1,
             )
             await self.disconnect_peer(pid, end_cause=SESSION_END_SWEPT)
@@ -1716,7 +1733,7 @@ async def events(request: Request, token: str = Depends(_resolve_hf_token)):
     if not username:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-    logger.info("SSE connection request from user: %s", username)
+    logger.info("SSE connection request")
 
     if not check_rate_limit(token):
         raise HTTPException(status_code=429, detail="Rate limit exceeded. Try again later.")
