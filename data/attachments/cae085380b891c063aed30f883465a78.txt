@@ -1,0 +1,5 @@
+WARNING  fleet_usage:fleet_usage.py:1094 Fleet usage publish to dataset pollen-robotics/fleet_usage_test still running after 0s; rows kept until it completes
+WARNING  fleet_usage:fleet_usage.py:1077 Fleet usage: previous publish still running, skipping this cycle
+WARNING  fleet_usage:fleet_usage.py:1077 Fleet usage: previous publish still running, skipping this cycle
+WARNING  fleet_usage:fleet_usage.py:1077 Fleet usage: previous publish still running, skipping this cycle
+WARNING  fleet_usage:fleet_usage.py:1128 Fleet usage: previous publish still running, skipping final publish

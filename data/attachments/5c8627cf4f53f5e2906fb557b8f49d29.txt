@@ -1,1 +1,0 @@
-WARNING  app:app.py:1553 Sweeping stale producer 3e8017c9-3644-4ece-8a39-181de98c7b21 (name='mini1', silent for 31s)
