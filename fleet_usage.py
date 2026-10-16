@@ -82,6 +82,18 @@ USAGE_MAX_HARDWARE_ID_LEN = 128
 # as dropped and logged once per window / day.
 USAGE_MAX_KEYS_PER_USER = 20
 USAGE_MAX_KEYS_PER_SET = 20000
+# Per-app sessions (daily rows only). The consumer's ``meta.name`` is
+# client-controlled free text, so a name is published only once this many
+# distinct HF accounts used it that day: below that it may be someone's
+# private app, and it is counted under ``other``.
+APP_MIN_USERS = 3
+APP_OTHER = "other"
+APP_NAME_MAX_LEN = 64
+# Distinct names tracked per day; later ones count as ``other``.
+APP_MAX_NAMES_PER_DAY = 1000
+# Apps listed in summary.json, over the last USAGE_SUMMARY_APPS_DAYS days.
+USAGE_SUMMARY_APPS = 15
+USAGE_SUMMARY_APPS_DAYS = 7
 # Frozen rows waiting to be published. 2000 rows is ~13 days of 10-minute
 # windows: a long HF outage drops the oldest rows instead of growing
 # memory without bound.
@@ -152,6 +164,14 @@ def usage_robot_key(username: str, meta: dict) -> bytes:
     ).digest()
 
 
+def app_label(name: object) -> str:
+    """Normalise a consumer ``meta.name`` into a bounded label (never published raw)."""
+    if not isinstance(name, str):
+        return APP_OTHER
+    label = re.sub(r"[^a-z0-9._/-]+", "-", name[: APP_NAME_MAX_LEN * 4].lower()).strip("-")
+    return label[:APP_NAME_MAX_LEN] or APP_OTHER
+
+
 def _kind_zeros() -> dict[str, int]:
     return {kind: 0 for kind in PUBLIC_ROBOT_KINDS}
 
@@ -220,6 +240,30 @@ def _duration_aggs() -> dict[str, _DurationAgg]:
 
 
 @dataclass
+class _AppAgg:
+    """Sessions of one consumer app over a day; ``users`` are in-memory digests."""
+
+    sessions: int = 0
+    users: set[bytes] = field(default_factory=set)
+    durations: _DurationAgg = field(default_factory=_DurationAgg)
+
+    def as_dict(self) -> dict:
+        return {"sessions": self.sessions, "users": len(self.users), "durations": self.durations.as_dict()}
+
+
+def _apps_row(apps: dict[str, _AppAgg]) -> dict:
+    """Publishable per-app counts: names below ``APP_MIN_USERS`` fold into ``other``."""
+    out: dict[str, dict] = {}
+    other: dict = {}
+    for label, agg in sorted(apps.items(), key=lambda item: (-item[1].sessions, item[0])):
+        if label != APP_OTHER and len(agg.users) >= APP_MIN_USERS:
+            out[label] = agg.as_dict()
+        else:
+            other = _merge_apps(other, {APP_OTHER: agg.as_dict()})
+    return {**out, **other}
+
+
+@dataclass
 class _WindowAgg:
     """Accumulators for the currently open usage window."""
 
@@ -249,6 +293,13 @@ class _DayAgg:
     distinct: _DistinctKeys = field(default_factory=_DistinctKeys)
     sessions_started: dict[str, int] = field(default_factory=_kind_zeros)
     durations: dict[str, _DurationAgg] = field(default_factory=_duration_aggs)
+    apps: dict[str, _AppAgg] = field(default_factory=dict)
+
+    def app(self, label: str) -> tuple[str, _AppAgg]:
+        """The day's aggregate for ``label``, or ``other`` once the name cap is hit."""
+        if label not in self.apps and len(self.apps) >= APP_MAX_NAMES_PER_DAY:
+            label = APP_OTHER
+        return label, self.apps.setdefault(label, _AppAgg())
 
 
 class UsageTracker:
@@ -299,8 +350,8 @@ class UsageTracker:
         self._mono = mono_clock
         # peer_id -> (robot key, kind, username) for every registered producer.
         self._producers: dict[str, tuple[bytes, str, str]] = {}
-        # session_id -> (monotonic start, producer kind at start).
-        self._sessions: dict[str, tuple[float, str]] = {}
+        # session_id -> (monotonic start, producer kind at start, app label).
+        self._sessions: dict[str, tuple[float, str, str]] = {}
         self._active_sessions = _kind_zeros()
         # ("window" | "daily", row) tuples frozen by rollover, oldest first.
         self.pending: deque[tuple[str, dict]] = deque(maxlen=pending_max_rows)
@@ -408,13 +459,33 @@ class UsageTracker:
         self.maybe_roll()
         self._producers.pop(peer_id, None)
 
-    def session_started(self, session_id: str, producer_meta: dict) -> None:
-        """A session was created; its kind is the producer's kind right now."""
+    def session_started(
+        self,
+        session_id: str,
+        producer_meta: dict,
+        consumer_username: str = "",
+        consumer_meta: Optional[dict] = None,
+    ) -> None:
+        """A session was created; its kind is the producer's kind right now.
+
+        The consumer's ``meta.space_id`` (else ``meta.name``) and account
+        feed the daily per-app counts (see ``_apps_row`` for what gets
+        published).
+        """
         self.maybe_roll()
         if session_id in self._sessions:
             return
         kind = robot_kind_of(producer_meta)
-        self._sessions[session_id] = (self._mono(), kind)
+        meta = consumer_meta or {}
+        # The Space id names the app unambiguously; display names collide.
+        label = app_label(meta.get("space_id"))
+        if label == APP_OTHER:
+            label = app_label(meta.get("name"))
+        label, app = self._day.app(label)
+        app.sessions += 1
+        if consumer_username and len(app.users) < USAGE_MAX_KEYS_PER_SET:
+            app.users.add(hashlib.blake2b(consumer_username.encode("utf-8", "surrogatepass"), digest_size=8).digest())
+        self._sessions[session_id] = (self._mono(), kind, label)
         self._active_sessions[kind] += 1
         self._window.sessions_started[kind] += 1
         self._day.sessions_started[kind] += 1
@@ -431,11 +502,12 @@ class UsageTracker:
         entry = self._sessions.pop(session_id, None)
         if entry is None:
             return
-        started_mono, kind = entry
+        started_mono, kind, label = entry
         self._active_sessions[kind] = max(0, self._active_sessions[kind] - 1)
         duration = round(max(0.0, self._mono() - started_mono), 1)
         self._window.durations[kind].add(duration)
         self._day.durations[kind].add(duration)
+        self._day.app(label)[1].durations.add(duration)
         category = cause if cause in SESSION_END_REASONS else SESSION_END_OTHER
         self._window.end_reasons[category] += 1
 
@@ -465,6 +537,7 @@ class UsageTracker:
             "robots_distinct": day.distinct.counts(),
             "sessions_started": dict(day.sessions_started),
             "session_durations": {k: v.as_dict() for k, v in day.durations.items()},
+            "apps": _apps_row(day.apps),
         }
 
     def pending_snapshot(self) -> list[tuple[str, dict]]:
@@ -547,6 +620,20 @@ def _merge_duration_dicts(a: object, b: object) -> dict:
     return {kind: _merge_durations(a.get(kind), b.get(kind)) for kind in list(a) + [k for k in b if k not in a]}
 
 
+def _merge_apps(a: object, b: object) -> dict:
+    """Combine two per-app dicts: sessions and durations add, users take the max."""
+    a, b = _as_dict(a), _as_dict(b)
+    out = {}
+    for label in list(a) + [k for k in b if k not in a]:
+        x, y = _as_dict(a.get(label)), _as_dict(b.get(label))
+        out[label] = {
+            "sessions": _num(x.get("sessions")) + _num(y.get("sessions")),
+            "users": max(_num(x.get("users")), _num(y.get("users"))),
+            "durations": _merge_durations(x.get("durations"), y.get("durations")),
+        }
+    return out
+
+
 def merge_usage_rows(row_type: str, older: dict, newer: dict) -> dict:
     """Combine two partial rows for the same window / day from two processes.
 
@@ -572,6 +659,7 @@ def merge_usage_rows(row_type: str, older: dict, newer: dict) -> dict:
         )
     else:
         merged["partial"] = True
+        merged["apps"] = _merge_apps(older.get("apps"), newer.get("apps"))
     return merged
 
 
@@ -708,6 +796,17 @@ def build_summary(windows: dict[str, dict], daily: dict[str, dict], now: float, 
     ]
 
     days = [daily[k] for k in sorted(daily)][-USAGE_SUMMARY_DAILY_ROWS:]
+    recent_apps: dict = {}
+    apps_since = _utc_day(now - (USAGE_SUMMARY_APPS_DAYS - 1) * 86400)
+    for day in days:
+        if day["day"] >= apps_since:
+            recent_apps = _merge_apps(recent_apps, day.get("apps"))
+    top_apps = sorted(
+        (item for item in recent_apps.items() if item[0] != APP_OTHER),
+        key=lambda item: (-item[1]["sessions"], item[0]),
+    )[:USAGE_SUMMARY_APPS]
+    if APP_OTHER in recent_apps:
+        top_apps.append((APP_OTHER, recent_apps[APP_OTHER]))
     return {
         "schema_version": USAGE_SCHEMA_VERSION,
         "generated_at": _iso_utc(now),
@@ -724,6 +823,21 @@ def build_summary(windows: dict[str, dict], daily: dict[str, dict], now: float, 
                 kind: [_num(_as_dict(d.get("robots_distinct")).get(kind)) for d in days]
                 for kind in PUBLIC_ROBOT_KINDS
             },
+        },
+        # Busiest consumer apps over the last USAGE_SUMMARY_APPS_DAYS UTC
+        # days; ``users`` is the largest single-day count (a lower bound).
+        "apps": {
+            "days": USAGE_SUMMARY_APPS_DAYS,
+            "min_users": APP_MIN_USERS,
+            "rows": [
+                {
+                    "app": label,
+                    "sessions": agg["sessions"],
+                    "users": agg["users"],
+                    "hours": round(_num(agg["durations"].get("sum_s")) / 3600, 1),
+                }
+                for label, agg in top_apps
+            ],
         },
     }
 
@@ -1300,6 +1414,10 @@ _USAGE_SECTION_SOURCE = """        <section class="card usage" id="usage">
                 .tile-value { font-size: 22px; font-weight: 700; letter-spacing: -0.3px; margin-top: 2px; }
                 .usage-foot { margin: 16px 0 0; font-size: 12px; color: var(--text-secondary); }
                 .usage-foot a { color: var(--accent); }
+                .apps-table { width: 100%; margin-top: 8px; border-collapse: collapse; font-size: 13px; }
+                .apps-table th, .apps-table td { padding: 4px 8px; border-bottom: 1px solid var(--divider); text-align: right; }
+                .apps-table th:first-child, .apps-table td:first-child { text-align: left; word-break: break-all; }
+                .apps-table th { font-weight: 600; color: var(--text-secondary); }
                 @media (max-width: 520px) { .tiles { grid-template-columns: repeat(2, 1fr); } }
             </style>
             <div class="usage-head">
@@ -1337,6 +1455,15 @@ _USAGE_SECTION_SOURCE = """        <section class="card usage" id="usage">
                     <div class="chart-note">UTC days, last 365. Partial days (server not up all day) are flagged in the tooltip.</div>
                     <p class="chart-empty" id="usage-daily-empty" hidden>No daily data yet.</p>
                     <div class="chart-box" id="usage-daily-box"><canvas id="usage-daily" aria-label="Distinct robots per day"></canvas></div>
+                </div>
+                <div class="chart-block">
+                    <div class="chart-title">Top apps</div>
+                    <div class="chart-note" id="usage-apps-note"></div>
+                    <p class="chart-empty" id="usage-apps-empty" hidden>No app data yet.</p>
+                    <table class="apps-table" id="usage-apps-table" hidden>
+                        <thead><tr><th>App</th><th>Sessions</th><th>Users (max/day)</th><th>Hours</th></tr></thead>
+                        <tbody id="usage-apps-body"></tbody>
+                    </table>
                 </div>
             </div>
             <p class="usage-foot">All times UTC. Source: <a id="usage-source" rel="noopener" target="_blank">dataset</a><span id="usage-generated"></span>.</p>
@@ -1503,6 +1630,27 @@ _USAGE_SECTION_SOURCE = """        <section class="card usage" id="usage">
                 });
             }
 
+            function renderApps(apps) {
+                var rows = arr(apps && apps.rows);
+                var body = document.getElementById("usage-apps-body");
+                document.getElementById("usage-apps-note").textContent =
+                    "Sessions per consumer app over the last " + num(apps && apps.days) +
+                    " UTC days. An app is named once at least " + num(apps && apps.min_users) +
+                    " accounts used it in a day; the rest is 'other'.";
+                document.getElementById("usage-apps-empty").hidden = rows.length > 0;
+                document.getElementById("usage-apps-table").hidden = rows.length === 0;
+                body.replaceChildren();
+                rows.forEach(function (r) {
+                    var tr = document.createElement("tr");
+                    [String(r.app), String(num(r.sessions)), String(num(r.users)), num(r.hours).toFixed(1)].forEach(function (v) {
+                        var td = document.createElement("td");
+                        td.textContent = v;
+                        tr.appendChild(td);
+                    });
+                    body.appendChild(tr);
+                });
+            }
+
             function render() {
                 var data = state.data || {};
                 if (!observed(data.recent) && !observed(data.hourly) && !arr(data.daily && data.daily.days).length) {
@@ -1559,6 +1707,7 @@ _USAGE_SECTION_SOURCE = """        <section class="card usage" id="usage">
                 }], { xTitle: "Duration" });
 
                 renderDaily(data.daily);
+                renderApps(data.apps);
                 statusEl.hidden = true;
                 bodyEl.hidden = false;
             }

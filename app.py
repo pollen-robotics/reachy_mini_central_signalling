@@ -1327,7 +1327,7 @@ class SignalingServer:
 
         # Store session
         self.sessions[session_id] = (producer_id, peer.peer_id)
-        self._track("session_started", session_id, producer.meta)  # usage
+        self._track("session_started", session_id, producer.meta, peer.username, peer.meta)  # usage
         peer.session_id = session_id
         peer.partner_id = producer_id
         peer.role = "consumer"

@@ -129,6 +129,32 @@ disconnects.
   Server restarts close every SSE channel, so sessions open at shutdown
   are counted as `peer_disconnected` in the last (partial) window.
 
+### Sessions per app (daily rows only)
+
+Each session is attributed to the consumer that started it, by its
+`meta.space_id` when present (a web app's HF Space id), otherwise its
+`meta.name` (what the JS SDK's `appName`, the desktop app, the mobile
+app or a Python consumer report; see
+[`META_CONTRACT.md`](META_CONTRACT.md)). Both are client-controlled and
+may name someone's private app, so:
+
+- it is normalised into a **label**: lowercased, every run of
+  characters outside `a-z0-9._/-` replaced by `-`, at most 64
+  characters; a missing or empty name is `other`;
+- a label is published only if **at least `APP_MIN_USERS` (3) distinct
+  HF accounts** used it that day. Below that it is counted under
+  `other`. A name used by several unrelated accounts is effectively a
+  public app; one person's private app never shows up by name;
+- per day, at most 1000 labels are tracked; later ones count as
+  `other`;
+- accounts are kept as in-memory digests for the day, like robot keys;
+  only their count is published.
+
+Per label: `sessions` (started that day), `users` (distinct accounts;
+for `other`, the largest folded app's count) and `durations` (sessions that ended that day, same shape as
+`session_durations`). Apps are not broken down per window: a small
+app's 10-minute series would show one person's usage pattern.
+
 ### Coverage and partial rows
 
 - **`coverage_s`** (window): seconds of the window during which this
@@ -178,7 +204,8 @@ restart. To limit the damage:
    `session_end_reasons`) and `coverage_s` (capped) are summed;
    `robots_distinct`, `robots_peak` and `sessions_peak` take the max,
    which is a lower bound since the two processes' robot sets cannot be
-   combined exactly. Otherwise the new row wins. A row this process
+   combined exactly. Per-app `sessions` and `durations` are summed and
+   `users` takes the max, for the same reason. Otherwise the new row wins. A row this process
    already published is always replaced, never merged twice, so retries
    are idempotent.
 
@@ -232,11 +259,16 @@ above.
   "partial": false,
   "robots_distinct": {"reachy_mini": 287, "microduck": 12, "other": 0},
   "sessions_started": {"reachy_mini": 2210, "microduck": 64, "other": 0},
-  "session_durations": {"reachy_mini": {"count": 2203, "sum_s": 512301.7, "max_s": 30112.9, "hist": [410, 380, 700, 420, 250, 43]}, "...": "..."}
+  "session_durations": {"reachy_mini": {"count": 2203, "sum_s": 512301.7, "max_s": 30112.9, "hist": [410, 380, 700, 420, 250, 43]}, "...": "..."},
+  "apps": {
+    "reachy-desktop-app": {"sessions": 1410, "users": 198, "durations": {"count": 1405, "sum_s": 401210.3, "max_s": 30112.9, "hist": [250, 210, 480, 290, 150, 25]}},
+    "conversation-app": {"sessions": 520, "users": 61, "durations": {"...": "..."}},
+    "other": {"sessions": 280, "users": 74, "durations": {"...": "..."}}
+  }
 }
 ```
 
-A daily row is emitted when the UTC day ends (or as a partial snapshot
+`apps` is absent from rows written before it was added. A daily row is emitted when the UTC day ends (or as a partial snapshot
 on shutdown).
 
 ### `summary.json`
@@ -266,6 +298,10 @@ observed. About 35 KB with full history (8 days of windows, 365 days):
     "coverage_s": [86400, "..."],
     "partial": [false, "..."],
     "robots_distinct": {"reachy_mini": [287, "..."], "microduck": ["..."], "other": ["..."]}
+  },
+  "apps": {
+    "days": 7, "min_users": 3,
+    "rows": [{"app": "reachy-desktop-app", "sessions": 9870, "users": 212, "hours": 780.4}, "...", {"app": "other", "sessions": 1950, "users": 80, "hours": 61.2}]
   }
 }
 ```
@@ -281,6 +317,9 @@ observed. About 35 KB with full history (8 days of windows, 365 days):
   shows fleet-wide duration statistics).
 - `daily`: the last 365 daily rows, reduced to what the daily chart
   shows.
+- `apps`: the 15 busiest labels over the last 7 UTC days, plus `other`
+  (the "Top apps" table). `users` is the largest single-day count, a
+  lower bound of the accounts over the 7 days.
 
 It is rewritten on every publish, in the same commit as the files it
 summarises.
