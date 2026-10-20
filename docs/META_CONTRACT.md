@@ -14,7 +14,8 @@ opaque to the server.
 
 | Key | Sent by | Server-side use |
 | --- | --- | --- |
-| `name` | producer, consumer | Producer: `robotName` in `/api/robot-status`. Consumer: reported as `activeApp` while it holds a session. Display only. |
+| `name` | producer, consumer | Producer: `robotName` in `/api/robot-status`. Consumer: reported as `activeApp` while it holds a session, and counted per app in fleet usage once enough accounts use it (see [`FLEET_USAGE.md`](FLEET_USAGE.md#sessions-per-app-daily-rows-only)). |
+| `space_id` | consumer (optional) | HF Space id of a web app (`owner/name`). Preferred over `name` to label the app in fleet usage, since display names collide. |
 | `hardware_id` | producer (daemons >= v1.7.2) | Stable per-robot identity: a new registration with the same `hardware_id` under the same HF user evicts the older producer (last-writer-wins). Its presence also marks the daemon as heartbeat-capable, which opts it into the stale-producer sweep. |
 | `install_id` | producer (reserved) | Same dedup semantics as `hardware_id`, checked independently. Not emitted by any shipped daemon yet. |
 | `kind` | producer | Robot family, used **only** for the public per-kind counters (`/health` `producers_by_kind`, status page). See below. |
