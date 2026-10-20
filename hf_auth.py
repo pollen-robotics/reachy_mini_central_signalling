@@ -477,9 +477,9 @@ class TokenValidator:
             self.negative_cache.pop(key, None)
             self._refresh_not_before.pop(key, None)
             if known:
-                logger.debug("Token re-validated for user: %s", username)
+                logger.debug("Token re-validated")
             else:
-                logger.info("Token validated for user: %s", username)
+                logger.info("Token validated")
             return username
 
         if status_code in (401, 403):

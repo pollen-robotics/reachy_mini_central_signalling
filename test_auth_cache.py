@@ -707,11 +707,12 @@ async def test_validated_is_info_first_time_debug_on_refresh(v, clock, caplog, b
         clock.advance(TOKEN_CACHE_TTL_SECONDS + TOKEN_CACHE_TTL_JITTER_SECONDS + 1)
         assert await v.validate("tok") == "alice"
         await _drain(v)
-    first = _messages(caplog, "Token validated for user: alice")
+    first = _messages(caplog, "Token validated")
     assert [r.levelno for r in first] == [logging.INFO]
-    refresh = _messages(caplog, "re-validated for user: alice")
+    refresh = _messages(caplog, "Token re-validated")
     assert [r.levelno for r in refresh] == [logging.DEBUG]
     assert backend.calls == 2
+    assert not any("alice" in r.getMessage() for r in caplog.records)
 
 
 async def test_inconclusive_warning_is_rate_limited(v, backend, clock, caplog):
