@@ -1,0 +1,15 @@
+INFO     app:app.py:774 New peer created: a77a5f42-7ffd-48dd-87a7-453b51d63006
+INFO     app:app.py:774 New peer created: c4e974e1-43fd-49ba-b0f7-eca5b9aab8e4
+INFO     app:app.py:774 New peer created: e3c0470b-ec1a-4eca-b455-d4fc1d8dce3c
+DEBUG    app:app.py:1515 Received from a77a5f42-7ffd-48dd-87a7-453b51d63006: setPeerStatus
+INFO     app:app.py:1106 Producer registered: a77a5f42-7ffd-48dd-87a7-453b51d63006 with meta: kind=reachy_mini keys=[hardware_id,name,transport]
+INFO     app:app.py:1403 Session started: a1f82427-ecc5-4b0b-9d2e-78719c5bd856
+WARNING  app:app.py:1313 Peer e3c0470b-ec1a-4eca-b455-d4fc1d8dce3c tried to access producer a77a5f42-7ffd-48dd-87a7-453b51d63006 owned by another user
+DEBUG    app:app.py:1515 Received from a77a5f42-7ffd-48dd-87a7-453b51d63006: setPeerStatus
+INFO     app:app.py:1505 Session ended: a1f82427-ecc5-4b0b-9d2e-78719c5bd856 (reason='producer_withdrew')
+INFO     app:app.py:1149 Producer withdrew: a77a5f42-7ffd-48dd-87a7-453b51d63006 (meta: kind=reachy_mini keys=[hardware_id,name,transport])
+DEBUG    app:app.py:1515 Received from a77a5f42-7ffd-48dd-87a7-453b51d63006: setPeerStatus
+INFO     app:app.py:1106 Producer registered: a77a5f42-7ffd-48dd-87a7-453b51d63006 with meta: kind=reachy_mini keys=[hardware_id,name,transport]
+WARNING  app:app.py:1594 Sweeping stale producer a77a5f42-7ffd-48dd-87a7-453b51d63006 (silent for 31s)
+INFO     app:app.py:1712 Producer disconnected: a77a5f42-7ffd-48dd-87a7-453b51d63006
+INFO     app:app.py:1714 Peer disconnected: a77a5f42-7ffd-48dd-87a7-453b51d63006
