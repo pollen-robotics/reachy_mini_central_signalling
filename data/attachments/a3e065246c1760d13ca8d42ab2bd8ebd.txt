@@ -1,0 +1,1 @@
+WARNING  app:app.py:1571 Sweeping stale producer c824f831-7156-41cf-b76c-4ec20c4f5039 (silent for 31s)
