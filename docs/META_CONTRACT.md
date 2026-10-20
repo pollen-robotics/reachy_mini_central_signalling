@@ -20,6 +20,8 @@ opaque to the server.
 | `install_id` | producer (reserved) | Same dedup semantics as `hardware_id`, checked independently. Not emitted by any shipped daemon yet. |
 | `kind` | producer | Robot family, used **only** for the public per-kind counters (`/health` `producers_by_kind`, status page). See below. |
 | `robot_type` | producer | Alias for `kind`, consulted only when `kind` is absent or empty. |
+| `session_liveness` | producer (daemons with peer-link liveness) | `"peer"`: the daemon keeps a session alive as long as its peer-to-peer link, whatever happens to its own SSE. Central then keeps that session across the robot's SSE reconnect grace (like a consumer's) instead of ending it at detach. Absent: previous behaviour. |
+| `session_active` | producer (with `session_liveness: "peer"`) | `true` while the daemon serves a session. Only makes `busy: true` show in listings when central has no session on record (e.g. it ended one at an eviction the daemon rode out). Display only: `startSession` is still gated on central's own session table, and the robot answers busy or takes over a ghost. |
 
 Keys such as `transport`, `release` or `api_version` are passed through
 untouched and never interpreted.

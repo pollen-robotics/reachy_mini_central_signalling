@@ -1250,3 +1250,75 @@ async def test_route_generator_cancelled_at_queue_wait_detaches(route_server):
     phone = server.peers[server.token_to_peer["tok-phone"]]
     assert phone.detached_at is not None
     assert phone.grace_deadline == _clock.now + GRACE
+
+
+# ----------------------------------------------------------------------
+# Daemons owning their session liveness (meta.session_liveness == "peer")
+# ----------------------------------------------------------------------
+PEER_LIVENESS_MINI = {**MINI, "session_liveness": "peer"}
+
+
+async def test_peer_liveness_producer_detach_keeps_session_like_a_consumer():
+    """Its session lives on the peer link: central keeps it across the grace."""
+    clock = Clock()
+    usage = UsageRecorder()
+    server = _server(clock, usage)
+    robot = await _producer(server, "tok-robot", meta=PEER_LIVENESS_MINI)
+    phone = await _listener(server, "tok-phone")
+    sid = await _start(server, phone, robot)
+    _drain(phone)
+    _drain(robot)
+    usage.calls.clear()
+
+    await server.detach_peer(robot.peer_id)
+
+    assert server.sessions[sid] == (robot.peer_id, phone.peer_id)
+    assert _drain(phone) == []  # the phone is not told the session ended
+    assert server.get_producers_list("alice")[0]["busy"] is True
+    assert usage.events("session_ended") == []
+
+    # The robot comes back within the grace: same peer, same session.
+    clock.advance(5)
+    _connect(server, "tok-robot")
+    assert sid in server.sessions
+
+
+async def test_peer_liveness_producer_session_ends_at_grace_expiry():
+    """Past the grace the robot is evicted as before, ending its session."""
+    clock = Clock()
+    server = _server(clock)
+    robot = await _producer(server, "tok-robot", meta=PEER_LIVENESS_MINI)
+    phone = await _listener(server, "tok-phone")
+    sid = await _start(server, phone, robot)
+    _drain(phone)
+
+    await server.detach_peer(robot.peer_id)
+    clock.advance(GRACE + 1)
+    await server.expire_detached_peers()
+
+    assert server.sessions == {}
+    assert {"type": "endSession", "sessionId": sid} in _drain(phone)
+
+
+async def test_session_active_meta_shows_busy_without_a_central_session():
+    """A robot still serving a session central forgot is listed busy (display only)."""
+    clock = Clock()
+    server = _server(clock)
+    robot = await _producer(
+        server, "tok-robot", meta={**PEER_LIVENESS_MINI, "session_active": True}
+    )
+
+    assert server.get_producers_list("alice")[0]["busy"] is True
+    # Not a gate: a startSession still reaches the robot, which decides.
+    phone = await _listener(server, "tok-phone")
+    resp = await server.handle_message(phone, {"type": "startSession", "peerId": robot.peer_id})
+    assert resp["type"] == "sessionStarted"
+
+
+async def test_session_active_meta_is_ignored_without_peer_liveness():
+    """Only daemons opting into peer liveness can mark themselves busy."""
+    clock = Clock()
+    server = _server(clock)
+    await _producer(server, "tok-robot", meta={**MINI, "session_active": True})
+
+    assert server.get_producers_list("alice")[0]["busy"] is False
