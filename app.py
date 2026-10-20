@@ -286,7 +286,9 @@ RECOMMENDED_HEARTBEAT_INTERVAL_SECONDS = 10.0
 # broadcasts, same ``peer_disconnected`` end cause) - the daemon relay
 # tears down its local WebRTC sessions and forgets their ids whenever
 # its SSE drops, and never tells central, so keeping the session would
-# only leave a phantom busy lock. A detaching CONSUMER's session
+# only leave a phantom busy lock. Daemons that keep their sessions across
+# an SSE drop advertise ``meta.session_liveness == "peer"`` and their
+# session survives the grace too. A detaching CONSUMER's session
 # survives the grace: its media is peer-to-peer and outlives the SSE
 # channel, and the clients that do restart end their old session
 # themselves.
@@ -301,6 +303,19 @@ RECOMMENDED_HEARTBEAT_INTERVAL_SECONDS = 10.0
 SSE_RECONNECT_GRACE_SECONDS = max(
     0.0, float(os.getenv("REACHY_CENTRAL_SSE_GRACE_SECONDS", "15"))
 )
+
+# Daemons that own their session's liveness advertise
+# ``meta.session_liveness == "peer"``: a session lives as long as its
+# peer-to-peer link (data channel), not as long as the robot's signaling
+# channel. For them central keeps the session across the robot's SSE
+# reconnect grace like it does for a consumer, instead of ending it at
+# detach. See docs/META_CONTRACT.md.
+SESSION_LIVENESS_PEER = "peer"
+
+
+def _owns_session_liveness(peer: "Peer") -> bool:
+    return peer.meta.get("session_liveness") == SESSION_LIVENESS_PEER
+
 
 # Session ids a peer ended itself, remembered (per peer, bounded) so
 # stale ``endSession`` frames for them can be dropped from its queue.
@@ -927,7 +942,7 @@ class SignalingServer:
         peer.grace_deadline = now + self.sse_grace_seconds
         self.sse_stats["detach_total"] += 1
         logger.debug("SSE detach: %s (grace %.0fs)", peer_id, self.sse_grace_seconds)
-        if self._is_producer_side_of_session(peer):
+        if self._is_producer_side_of_session(peer) and not _owns_session_liveness(peer):
             await self._end_session_at_detach(peer)
 
     async def expire_detached_peers(self) -> list[str]:
@@ -1220,6 +1235,14 @@ class SignalingServer:
         down, or when the consumer never advertised a name.
         """
         if not producer.session_id:
+            # A daemon that owns its session liveness reports it in its
+            # heartbeat meta: it may still be serving a session central
+            # already forgot (e.g. ended at an eviction while the robot
+            # and the client kept talking over the LAN). Display only:
+            # startSession is still gated on central's own session table
+            # and the robot decides (busy, or take over a ghost).
+            if _owns_session_liveness(producer) and producer.meta.get("session_active") is True:
+                return True, None
             return False, None
         active_app: Optional[str] = None
         if producer.partner_id and producer.partner_id in self.peers:
