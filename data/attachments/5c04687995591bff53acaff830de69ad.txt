@@ -1,0 +1,12 @@
+DEBUG    app:app.py:1515 Received from 58f03c3c-82ae-42d7-a0c0-36edb992f309: setPeerStatus
+INFO     app:app.py:1106 Producer registered: 58f03c3c-82ae-42d7-a0c0-36edb992f309 with meta: kind=reachy_mini keys=[hardware_id,name]
+DEBUG    app:app.py:1515 Received from 58f03c3c-82ae-42d7-a0c0-36edb992f309: setPeerStatus
+DEBUG    app:app.py:1106 Producer registered: 58f03c3c-82ae-42d7-a0c0-36edb992f309 with meta: kind=reachy_mini keys=[hardware_id,name]
+DEBUG    app:app.py:1515 Received from 58f03c3c-82ae-42d7-a0c0-36edb992f309: setPeerStatus
+INFO     app:app.py:1106 Producer registered: 58f03c3c-82ae-42d7-a0c0-36edb992f309 with meta: kind=reachy_mini keys=[hardware_id,name]
+DEBUG    app:app.py:1515 Received from 58f03c3c-82ae-42d7-a0c0-36edb992f309: setPeerStatus
+INFO     app:app.py:1149 Producer withdrew: 58f03c3c-82ae-42d7-a0c0-36edb992f309 (meta: kind=reachy_mini keys=[hardware_id,name])
+DEBUG    app:app.py:1515 Received from 58f03c3c-82ae-42d7-a0c0-36edb992f309: setPeerStatus
+INFO     app:app.py:1106 Producer registered: 58f03c3c-82ae-42d7-a0c0-36edb992f309 with meta: kind=reachy_mini keys=[hardware_id,name]
+DEBUG    app:app.py:1515 Received from 58f03c3c-82ae-42d7-a0c0-36edb992f309: setPeerStatus
+INFO     app:app.py:1106 Producer registered: 58f03c3c-82ae-42d7-a0c0-36edb992f309 with meta: kind=reachy_mini keys=[blob,hardware_id,name]

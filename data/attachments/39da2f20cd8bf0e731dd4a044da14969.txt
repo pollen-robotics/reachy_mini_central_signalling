@@ -1,1 +1,0 @@
-WARNING  app:app.py:1086 Rejected setPeerStatus from 607fa31f-5a72-4cb2-ad96-ba033edc6e1c: meta must be an object, got str
